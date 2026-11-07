@@ -2,7 +2,7 @@
 
 One small terminal client for **any LLM API key**.
 
-Save a key once, then chat, pipe prompts, switch models, and keep conversations
+Save a key once, then chat, Type prompts, switch models, and keep conversations
 without remembering each provider's API shape. It speaks OpenAI, Anthropic
 Claude, Google Gemini, and any OpenAI-compatible endpoint.
 
