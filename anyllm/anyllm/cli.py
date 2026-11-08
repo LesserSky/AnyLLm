@@ -42,7 +42,16 @@ from .session import (
     load_session_data,
     session_base_url,
 )
-from .term import Style, color_enabled, setup as term_setup
+from .term import (
+    Style,
+    color_enabled,
+    format_error,
+    format_reply_status,
+    format_table,
+    is_tty,
+    redact_endpoint,
+    setup as term_setup,
+)
 
 EXAMPLES = """\
 examples:
@@ -278,12 +287,10 @@ def main(argv: list[str] | None = None) -> int:
     except SystemExit as exc:
         return int(exc.code or 0)
 
-    style = Style(
-        color_enabled(
-            no_color=getattr(args, "no_color", False)
-            or getattr(args, "no_color_global", False)
-        )
+    no_color_flag = bool(
+        getattr(args, "no_color", False) or getattr(args, "no_color_global", False)
     )
+    style = Style(color_enabled(no_color=no_color_flag), no_color=no_color_flag)
     try:
         if not hasattr(args, "func"):
             parser.print_help()
@@ -307,10 +314,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
 
+def _stderr_style(style: Style) -> Style:
+    """Color errors for the terminal even when stdout is a pipe."""
+    if style.no_color:
+        return Style(False, no_color=True)
+    return Style(color_enabled(stream=sys.stderr))
+
+
 def _print_error(style: Style, exc: AnyLLMError) -> None:
-    print(style.red("error: ") + exc.message, file=sys.stderr)
-    if exc.hint:
-        print(style.dim("  " + exc.hint), file=sys.stderr)
+    for line in format_error(_stderr_style(style), exc):
+        print(line, file=sys.stderr)
 
 
 # -- shared resolution ------------------------------------------------------
@@ -502,7 +515,7 @@ def _choose_provider(providers: dict[str, Provider], style: Style) -> Provider:
     print("No provider is configured yet. Choose one:")
     for name in names:
         provider = providers[name]
-        print(f"  {style.cyan(name.ljust(12))} {provider.label}")
+        print(f"  {style.accent(name.ljust(12))} {provider.label}")
     print(style.dim("  custom endpoints: add one first with `anyllm providers add`"))
     while True:
         try:
@@ -696,9 +709,14 @@ def _ask(
         _warn_finish(turn, style)
         return 0
 
+    # Piped stdout is the answer alone: no spinner, color, or status line.
+    interactive = is_tty(sys.stdout)
+    answer_style = style if interactive else Style(False, no_color=True)
     if stream:
         printer = StreamPrinter(
-            style, show_reasoning=session.show_reasoning, spinner=sys.stdout.isatty()
+            answer_style,
+            show_reasoning=session.show_reasoning,
+            spinner=interactive,
         )
         printer.begin()
         try:
@@ -722,6 +740,8 @@ def _ask(
             sys.stdout.write("\n")
         sys.stdout.flush()
 
+    if interactive:
+        print(format_reply_status(style, turn.elapsed, turn.usage), file=sys.stderr)
     _warn_finish(turn, style)
     return 0
 
@@ -759,8 +779,13 @@ def cmd_models(args, style: Style) -> int:
     if not models:
         print(style.yellow("no models returned"), file=sys.stderr)
         return 0
-    for name in models:
-        print(name)
+    # Scripts and pipes keep one name per line. A terminal gets a small table.
+    if not is_tty(sys.stdout):
+        for name in models:
+            print(name)
+        return 0
+    for line in format_table(style, ["MODEL"], [[name] for name in models]):
+        print(line)
     return 0
 
 
@@ -846,17 +871,8 @@ def cmd_keys_list(args, style: Style) -> int:
             env_text = "-"
         rows.append((name, saved, env_text))
 
-    name_width = max([len("PROVIDER")] + [len(row[0]) for row in rows])
-    saved_width = max([len("SAVED")] + [len(row[1]) for row in rows])
-    header = (
-        "PROVIDER".ljust(name_width)
-        + "  "
-        + "SAVED".ljust(saved_width)
-        + "  ENVIRONMENT"
-    )
-    print(style.bold(header))
-    for name, saved, env_text in rows:
-        print(f"{name.ljust(name_width)}  {saved.ljust(saved_width)}  {env_text}")
+    for line in format_table(style, ["PROVIDER", "SAVED", "ENVIRONMENT"], rows):
+        print(line)
     print()
     print(style.dim(f"key file: {keys_path()}"))
     print(
@@ -908,37 +924,19 @@ def cmd_providers_list(args, style: Style) -> int:
     rows = []
     for name in sorted(providers):
         provider = providers[name]
-        marker = "*" if name in custom else " "
+        label = f"{name} *" if name in custom else name
         rows.append(
             (
-                marker + name,
+                label,
                 provider.kind,
                 _key_status(provider, store),
                 provider.default_model or "-",
             )
         )
-    name_width = max([len("PROVIDER") + 1] + [len(row[0]) for row in rows])
-    kind_width = max([len("KIND")] + [len(row[1]) for row in rows])
-    key_width = max([len("KEY")] + [len(row[2]) for row in rows])
-    header = (
-        "PROVIDER".ljust(name_width)
-        + "  "
-        + "KIND".ljust(kind_width)
-        + "  "
-        + "KEY".ljust(key_width)
-        + "  DEFAULT MODEL"
-    )
-    print(style.bold(header))
-    for name, kind, key, model in rows:
-        print(
-            name.ljust(name_width)
-            + "  "
-            + kind.ljust(kind_width)
-            + "  "
-            + key.ljust(key_width)
-            + "  "
-            + model
-        )
+    for line in format_table(
+        style, ["PROVIDER", "KIND", "KEY", "DEFAULT MODEL"], rows
+    ):
+        print(line)
     print()
     print(style.dim("* = custom provider; see `anyllm providers show NAME`"))
     return 0
@@ -949,10 +947,11 @@ def cmd_providers_show(args, style: Style) -> int:
     providers = load_providers(config)
     store = KeyStore()
     provider = get_provider(args.name, providers)
+    resolution = resolve_key(provider, store)
     print(style.bold(provider.name))
     print(f"  label:      {provider.label}")
     print(f"  kind:       {provider.kind}")
-    print(f"  base URL:   {provider.base_url or '(not set)'}")
+    print(f"  base URL:   {redact_endpoint(provider.base_url, resolution.value)}")
     print(f"  key needed: {'yes' if provider.key_required else 'no'}")
     print(f"  key source: {_key_status(provider, store)}")
     print(f"  models:     {', '.join(provider.models) if provider.models else '(none suggested)'}")
@@ -983,7 +982,7 @@ def cmd_providers_add(args, style: Style) -> int:
     config.set("custom_providers", custom)
     config.save()
     action = "updated" if replacing else "added"
-    print(f"{action} provider {style.bold(name)} → {spec['base_url']}")
+    print(f"{action} provider {style.bold(name)} → {redact_endpoint(spec['base_url'])}")
     print(style.dim(f"  kind: {spec['kind']}  key needed: {'yes' if spec['key_required'] else 'no'}"))
     if spec["models"]:
         print(style.dim(f"  default model: {spec['models'][0]}"))
@@ -1126,29 +1125,8 @@ def cmd_doctor(args, style: Style) -> int:
         if resolve_key(provider, store).value:
             ready += 1
         rows.append((name, provider.kind, status, provider.default_model or "-"))
-    name_width = max([len("PROVIDER")] + [len(row[0]) for row in rows])
-    kind_width = max([len("KIND")] + [len(row[1]) for row in rows])
-    status_width = max([len("KEY")] + [len(row[2]) for row in rows])
-    print(
-        style.bold(
-            "PROVIDER".ljust(name_width)
-            + "  "
-            + "KIND".ljust(kind_width)
-            + "  "
-            + "KEY".ljust(status_width)
-            + "  DEFAULT MODEL"
-        )
-    )
-    for name, kind, status, model in rows:
-        print(
-            name.ljust(name_width)
-            + "  "
-            + kind.ljust(kind_width)
-            + "  "
-            + status.ljust(status_width)
-            + "  "
-            + model
-        )
+    for line in format_table(style, ["PROVIDER", "KIND", "KEY", "DEFAULT MODEL"], rows):
+        print(line)
     print()
 
     if ready == 0:
