@@ -9,9 +9,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .adapters import Usage, stream_chat
-from .catalog import Provider
+from .catalog import Provider, validate_base_url
 from .config import read_json, sessions_dir, write_json
 from .errors import ConfigError, ProviderError, UsageError
+
+# Stored on a partial assistant turn when the user hits Ctrl-C mid-stream.
+INTERRUPTED_MARK = "[interrupted]"
 
 
 @dataclass
@@ -21,6 +24,42 @@ class Turn:
     usage: Usage
     elapsed: float
     finish_reason: str | None = None
+
+
+def _interrupted_content(text: str) -> str:
+    """Append a stable marker so history shows the answer was cut off."""
+    body = text.rstrip()
+    if body.endswith(INTERRUPTED_MARK):
+        return body
+    return f"{body}\n{INTERRUPTED_MARK}"
+
+
+def session_base_url(data: dict, provider: Provider, override: str | None = None) -> str:
+    """Choose the endpoint when a saved conversation is restored.
+
+    An explicit override wins. Otherwise a base URL stored in the session is
+    used, including when it differs from the provider default. Files written
+    before base URLs were saved omit the field and fall back to that default.
+    """
+    if isinstance(override, str) and override.strip():
+        return validate_base_url(override)
+    saved = data.get("base_url") if isinstance(data, dict) else None
+    if saved is None:
+        return provider.base_url or ""
+    if not isinstance(saved, str):
+        raise ConfigError(
+            "Saved session has an invalid base URL.",
+            hint="Expected a string. Fix the session file, or delete it.",
+        )
+    if not saved.strip():
+        return provider.base_url or ""
+    try:
+        return validate_base_url(saved)
+    except ConfigError as exc:
+        raise ConfigError(
+            f"Saved session has an invalid base URL {saved!r}.",
+            hint=exc.hint,
+        ) from None
 
 
 def finish_notice(finish_reason: str | None) -> str | None:
@@ -78,6 +117,11 @@ class Session:
         """Send a user message and stream the answer back."""
         if not isinstance(text, str) or not text.strip():
             raise UsageError("The message is empty.")
+        if not isinstance(self.model, str) or not self.model.strip():
+            raise UsageError(
+                "No model selected.",
+                hint="Set one with /model NAME.",
+            )
 
         self.messages.append({"role": "user", "content": text})
         start = time.perf_counter()
@@ -111,9 +155,16 @@ class Session:
                 if chunk.finish_reason:
                     finish_reason = chunk.finish_reason
         except KeyboardInterrupt:
-            if "".join(text_parts).strip():
+            partial = "".join(text_parts)
+            if partial.strip():
+                # Keep the fragment so the next turn has context, and mark it
+                # so the transcript does not look like a finished answer.
                 self.messages.append(
-                    {"role": "assistant", "content": "".join(text_parts)}
+                    {
+                        "role": "assistant",
+                        "content": _interrupted_content(partial),
+                        "interrupted": True,
+                    }
                 )
             else:
                 self.messages.pop()
@@ -144,7 +195,7 @@ class Session:
         )
 
     def to_dict(self) -> dict:
-        return {
+        payload = {
             "version": 1,
             "provider": self.provider.name,
             "model": self.model,
@@ -162,6 +213,10 @@ class Session:
             "usage": self.usage.to_dict(),
             "updated": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
         }
+        # Always record a resolved endpoint. Old files simply omit this key.
+        if isinstance(self.base_url, str) and self.base_url.strip():
+            payload["base_url"] = self.base_url
+        return payload
 
 
 # -- saved sessions ---------------------------------------------------------

@@ -81,7 +81,9 @@ You can also use environment variables. AnyLLM checks, in order:
 
 1. `ANYLLM_<PROVIDER>_API_KEY` (for example `ANYLLM_OPENAI_API_KEY`)
 2. The provider's usual variable (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, ...)
-3. `ANYLLM_API_KEY` (useful for a custom endpoint)
+3. `ANYLLM_API_KEY`, only for a custom OpenAI-compatible endpoint (the built-in
+   `custom` provider, or one you added). It is not sent to built-in hosts such
+   as OpenAI, Anthropic, Gemini, Groq, or local servers.
 4. The key saved with `anyllm keys set`
 
 Environment variables win over saved keys, which keeps CI predictable. Set
@@ -131,7 +133,8 @@ End a line with `\` to continue it on the next line. A message that must start
 with `/` can be sent as `//text`.
 
 Ctrl+C stops a streaming answer and keeps the partial reply in the
-conversation. Ctrl+C at the prompt clears the line; Ctrl+D exits.
+conversation, marked as interrupted. Ctrl+C at the prompt clears the line;
+Ctrl+D exits.
 
 ## One-shot prompts and pipes
 
@@ -321,6 +324,9 @@ input-history     readline prompt history (Linux/macOS)
   `keys set` writes them, from a hidden prompt or one line of stdin.
 - Prompts and replies go directly to the provider you select. AnyLLM has no
   telemetry, no account, and no server of its own.
+- `ANYLLM_API_KEY` is sent only to custom OpenAI-compatible endpoints. Built-in
+  providers never receive it, so a key meant for a gateway you added is not
+  forwarded to OpenAI, Anthropic, Gemini, or the other catalog hosts.
 - Saved conversations contain your prompts. They are written with owner-only
   permissions on POSIX; delete `sessions/` if you do not want them kept.
 

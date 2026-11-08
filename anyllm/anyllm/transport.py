@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import http.client
 import json
 import platform
@@ -20,9 +21,28 @@ USER_AGENT = (
     f"({platform.system()} {platform.release()}; Python {platform.python_version()})"
 )
 
-RETRY_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+# The server asked the client to try again and did not apply the request.
+# Safe for a completion POST, which is not idempotent.
+_SAFE_RETRY_STATUS = frozenset({408, 425, 429, 503})
+
+# These mean the server, or a gateway in front of it, already had the request.
+# Retry only when repeating it cannot duplicate a generation (GET, HEAD).
+_IDEMPOTENT_RETRY_STATUS = frozenset({500, 502, 504})
+
 MAX_RETRIES = 2
 MAX_RETRY_WAIT = 8.0
+
+# Connect never completed, so no HTTP request bytes were sent.
+_BEFORE_SEND_ERRNOS = {
+    number
+    for number in (
+        errno.ECONNREFUSED,
+        errno.EHOSTUNREACH,
+        errno.ENETUNREACH,
+        getattr(errno, "WSAECONNREFUSED", None),
+    )
+    if number is not None
+}
 
 _EVENT_BOUNDARY = re.compile(rb"\r?\n\r?\n")
 
@@ -41,33 +61,93 @@ def _safe_read(response) -> bytes:
         return b""
 
 
-def _extract_message(body: bytes) -> str:
+def _text_field(value) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if isinstance(value, list):
+        parts = [
+            str(item).strip()
+            for item in value
+            if isinstance(item, (str, int)) and str(item).strip()
+        ]
+        if parts:
+            return ".".join(parts)
+    return None
+
+
+def _format_detail_list(items) -> str:
+    parts: list[str] = []
+    for item in items:
+        if isinstance(item, str) and item.strip():
+            parts.append(item.strip())
+            continue
+        if not isinstance(item, dict):
+            continue
+        loc = item.get("loc")
+        loc_text = ""
+        if isinstance(loc, list):
+            loc_text = ".".join(str(part) for part in loc if part not in ("body", "root"))
+        msg = item.get("msg") or item.get("message") or item.get("type") or ""
+        msg = str(msg).strip() if msg else ""
+        if loc_text and msg:
+            parts.append(f"{loc_text}: {msg}")
+        elif msg:
+            parts.append(msg)
+        elif loc_text:
+            parts.append(loc_text)
+    return "; ".join(parts)
+
+
+def _parse_error_body(body: bytes) -> tuple[str, str | None, str | None]:
+    """Return ``(message, param, code)`` from an error response body."""
     text = body.decode("utf-8", "replace").strip()
     if not text:
-        return ""
+        return "", None, None
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError:
-        return text[:400]
-    if isinstance(parsed, dict):
-        detail = parsed.get("error")
-        if isinstance(detail, dict):
-            message = detail.get("message") or detail.get("code") or detail.get("type")
-            if message:
-                return str(message)[:400]
-        if isinstance(detail, str) and detail:
-            return detail[:400]
+        return text[:400], None, None
+    if not isinstance(parsed, dict):
+        return text[:400], None, None
+
+    param = _text_field(parsed.get("param"))
+    code = _text_field(parsed.get("code"))
+    message = ""
+
+    detail = parsed.get("error")
+    if isinstance(detail, dict):
+        param = _text_field(detail.get("param")) or param
+        code = _text_field(detail.get("code")) or code
+        raw = detail.get("message") or detail.get("code") or detail.get("type")
+        if raw:
+            message = str(raw)
+    elif isinstance(detail, str) and detail:
+        message = detail
+    elif isinstance(detail, list):
+        message = _format_detail_list(detail)
+
+    if not message:
         for key in ("message", "detail", "error_description", "msg"):
             value = parsed.get(key)
             if isinstance(value, str) and value:
-                return value[:400]
-    return text[:400]
+                message = value
+                break
+            if isinstance(value, list):
+                formatted = _format_detail_list(value)
+                if formatted:
+                    message = formatted
+                    break
+    if not message:
+        message = text
+    if param and param.lower() not in message.lower():
+        message = f"{message} ({param})" if message else param
+    return message[:400], param, code
 
 
 def raise_for_status(status: int, body: bytes, headers, url: str) -> None:
     """Turn an HTTP error into a specific, actionable exception."""
     host = urlsplit(url).netloc or url
-    message = _extract_message(body)
+    message, param, code = _parse_error_body(body)
     detail = f"{message} (HTTP {status})" if message else f"HTTP {status} from {host}"
     lowered = message.lower()
 
@@ -114,7 +194,13 @@ def raise_for_status(status: int, body: bytes, headers, url: str) -> None:
     elif status >= 500:
         hint = "The provider had a server error. Retry shortly."
 
-    raise APIError(f"request failed: {detail}", hint=hint, status=status)
+    raise APIError(
+        f"request failed: {detail}",
+        hint=hint,
+        status=status,
+        param=param,
+        code=code,
+    )
 
 
 def _retry_delay(headers, attempt: int) -> float | None:
@@ -129,6 +215,65 @@ def _retry_delay(headers, attempt: int) -> float | None:
                 return None
             return max(0.0, seconds)
     return 0.8 * (2**attempt)
+
+
+def _should_retry_status(status: int, *, replay_safe: bool) -> bool:
+    """Return whether an HTTP status is safe to send again.
+
+    409 is never retried: it means the request conflicts with one already
+    accepted. 500/502/504 are retried only for idempotent calls, because a
+    completion may already be generating. 408, 425, 429, and 503 explicitly
+    ask the client to try again.
+    """
+    if status in _SAFE_RETRY_STATUS:
+        return True
+    if replay_safe and status in _IDEMPOTENT_RETRY_STATUS:
+        return True
+    return False
+
+
+def _exception_reason(exc: BaseException) -> BaseException:
+    reason = getattr(exc, "reason", None)
+    if reason is None or reason is exc:
+        return exc
+    if isinstance(reason, BaseException):
+        return reason
+    return exc
+
+
+def _ssl_failure(exc: BaseException) -> bool:
+    reason = _exception_reason(exc)
+    return isinstance(exc, ssl.SSLError) or isinstance(reason, ssl.SSLError)
+
+
+def _failed_before_send(exc: BaseException) -> bool:
+    """True when the TCP connection never came up, so the POST was not sent.
+
+    urllib reports a connect timeout and a timeout while waiting for the
+    status line as the same ``URLError``. Timeouts are therefore treated as
+    possibly sent. Connection refused, unreachable hosts, and DNS failures
+    happen before any request bytes leave the machine.
+    """
+    reason = _exception_reason(exc)
+    if isinstance(reason, ConnectionRefusedError):
+        return True
+    if isinstance(reason, socket.gaierror):
+        return True
+    errno_value = getattr(reason, "errno", None)
+    if errno_value in _BEFORE_SEND_ERRNOS:
+        return True
+    text = str(reason).lower()
+    if "connection refused" in text or "actively refused" in text:
+        return True
+    return False
+
+
+def _should_retry_network(exc: BaseException, *, replay_safe: bool) -> bool:
+    if _ssl_failure(exc):
+        return False
+    if replay_safe:
+        return True
+    return _failed_before_send(exc)
 
 
 def _network_error(exc: BaseException, url: str) -> NetworkError:
@@ -148,8 +293,18 @@ def _open(
     headers: dict[str, str],
     timeout: float,
     retries: int,
+    *,
+    replay_safe: bool,
 ):
-    """Open a URL, retrying transient failures before any data is consumed."""
+    """Open a URL, retrying only failures that are safe to send again.
+
+    ``replay_safe`` is true for idempotent calls such as listing models.
+    Completion POSTs pass false: once the request has been written, a 5xx or
+    a dropped connection can mean the provider already started the generation.
+    A connection refused before the handshake still retries, because nothing
+    was sent. A failure while reading a response body is not handled here and
+    is not retried.
+    """
     request_headers = {
         "User-Agent": USER_AGENT,
         "Content-Type": "application/json",
@@ -166,14 +321,14 @@ def _open(
                 exc.close()
             except OSError:
                 pass
-            if attempt < retries and exc.code in RETRY_STATUS:
+            if attempt < retries and _should_retry_status(exc.code, replay_safe=replay_safe):
                 delay = _retry_delay(exc.headers, attempt)
                 if delay is not None:
                     time.sleep(delay)
                     continue
             raise_for_status(exc.code, body, exc.headers, url)
         except (error.URLError, TimeoutError, socket.timeout, ssl.SSLError, OSError) as exc:
-            if attempt < retries and not isinstance(exc, ssl.SSLError):
+            if attempt < retries and _should_retry_network(exc, replay_safe=replay_safe):
                 time.sleep(0.6 * (attempt + 1))
                 continue
             raise _network_error(exc, url) from None
@@ -190,9 +345,13 @@ def open_stream(
     timeout: float = 120.0,
     retries: int = MAX_RETRIES,
 ):
-    """POST JSON and return an open streaming response."""
+    """POST JSON and return an open streaming response.
+
+    The POST is not replayed after the server has seen it. Retries are limited
+    to 408/425/429/503 and to connection failures that happen before send.
+    """
     data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    return _open("POST", url, data, headers, timeout, retries)
+    return _open("POST", url, data, headers, timeout, retries, replay_safe=False)
 
 
 def request_json(
@@ -204,11 +363,18 @@ def request_json(
     timeout: float = 60.0,
     retries: int = MAX_RETRIES,
 ):
-    """Perform a request and decode a JSON object or array."""
+    """Perform a request and decode a JSON object or array.
+
+    GET/HEAD may retry server errors. Other methods follow the completion
+    rule: do not replay after the request was sent. A read error after the
+    status line is never retried here, because the server already accepted
+    the call.
+    """
     data = None
     if payload is not None:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    response = _open(method, url, data, headers, timeout, retries)
+    replay_safe = method.upper() in {"GET", "HEAD", "OPTIONS"}
+    response = _open(method, url, data, headers, timeout, retries, replay_safe=replay_safe)
     try:
         raw = response.read()
     except (OSError, http.client.HTTPException) as exc:
