@@ -6,9 +6,11 @@ import errno
 import http.client
 import json
 import platform
+import queue
 import re
 import socket
 import ssl
+import threading
 import time
 from urllib import error, request
 from urllib.parse import urlsplit, urlunsplit
@@ -415,73 +417,239 @@ def _event_payload(block: bytes) -> str | None:
     return "\n".join(parts)
 
 
-def _iter_sse(response):
+_READER_DONE = object()
+
+
+def _take_events(buffer: bytes, *, flush: bool):
+    """Split complete SSE events out of ``buffer``.
+
+    ``flush`` parses a trailing block only at a real end of stream. A deadline
+    or cancel leaves an unfinished fragment in the buffer instead of guessing.
+    """
+
+    events: list[str] = []
+    while True:
+        match = _EVENT_BOUNDARY.search(buffer)
+        if match is None:
+            break
+        block = buffer[: match.start()]
+        buffer = buffer[match.end() :]
+        payload = _event_payload(block)
+        if payload is None:
+            continue
+        events.append(payload)
+    if flush:
+        payload = _event_payload(buffer)
+        buffer = b""
+        if payload is not None:
+            events.append(payload)
+    return events, buffer
+
+
+def _events_finished(events):
+    """Return payloads to yield, and whether ``[DONE]`` ended the stream."""
+
+    out: list[str] = []
+    for payload in events:
+        if payload.strip() == "[DONE]":
+            return out, True
+        out.append(payload)
+    return out, False
+
+
+def _wake_blocked_read(response) -> None:
+    """Unblock a ``read1`` waiting for the next packet.
+
+    ``HTTPResponse.close`` waits for that read, so it cannot be used to
+    interrupt it. Shutting the socket down makes the read return. It does
+    not cancel the provider's request, and the read is not tried again.
+    """
+
+    try:
+        fd = response.fileno()
+    except Exception:
+        return
+    try:
+        sock = socket.fromfd(fd, socket.AF_INET, socket.SOCK_STREAM)
+    except OSError:
+        return
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def _read_available(response) -> bytes:
+    """One public read that returns bytes already buffered or the next packet.
+
+    ``read1`` does not wait until a large buffer is full, and it is not called
+    again after a timeout on this response. A short ``settimeout`` plus another
+    ``read`` raises ``cannot read from timed out object`` and drops what the
+    buffer already held.
+    """
+
+    read1 = getattr(response, "read1", None)
+    if read1 is not None:
+        return read1(8192)
+    return response.read(8192)
+
+
+def _iter_blocking(response):
     buffer = b""
     while True:
         chunk = response.read(8192)
         if not chunk:
-            break
-        buffer += chunk
-        while True:
-            match = _EVENT_BOUNDARY.search(buffer)
-            if match is None:
-                break
-            block = buffer[: match.start()]
-            buffer = buffer[match.end() :]
-            payload = _event_payload(block)
-            if payload is None:
-                continue
-            if payload.strip() == "[DONE]":
-                return
-            yield payload
-    payload = _event_payload(buffer)
-    if payload is not None and payload.strip() != "[DONE]":
-        yield payload
-
-
-def bound_read_timeout(response, seconds: float) -> bool:
-    """Best-effort cap on later socket reads. Returns whether a socket was found.
-
-    This does not abort a request the server has already accepted. It only
-    asks the local socket to wake up so cancellation and the overall deadline
-    can be noticed between reads.
-    """
-
-    fp = getattr(response, "fp", None)
-    raw = getattr(fp, "raw", None)
-    sock = getattr(raw, "_sock", None)
-    if sock is None or not hasattr(sock, "settimeout"):
-        return False
-    try:
-        sock.settimeout(max(0.1, float(seconds)))
-    except OSError:
-        return False
-    return True
-
-
-def iter_sse(response, *, keep_reading=None):
-    """Yield decoded SSE data payloads, translating read errors.
-
-    ``keep_reading`` may return true after a short socket timeout so the
-    caller can keep waiting until its own deadline. A false result, or no
-    callback, ends the stream. This is cooperative: it does not promise to
-    stop the provider.
-    """
-
-    while True:
-        try:
-            yield from _iter_sse(response)
+            events, _buffer = _take_events(buffer, flush=True)
+            yield from _events_finished(events)[0]
             return
-        except (socket.timeout, TimeoutError) as exc:
-            if keep_reading is not None and keep_reading():
-                continue
-            raise NetworkError(
-                f"connection broke while streaming: {exc}",
-                hint="The local read timed out. The provider may still be generating; "
-                "this does not cancel the request on the server.",
-            ) from None
-        except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
+        buffer += chunk
+        events, buffer = _take_events(buffer, flush=False)
+        payloads, done = _events_finished(events)
+        yield from payloads
+        if done:
+            return
+
+
+def iter_sse(response, *, deadline=None, cancel_event=None):
+    """Yield decoded SSE data payloads.
+
+    With no deadline and no cancel flag, this reads the body on the calling
+    thread. Otherwise a daemon thread is the only caller of ``read1``. The
+    caller waits on a queue, so a pause longer than a few seconds does not
+    time the socket out, and bytes already read are parsed before a deadline
+    or cancel wins. Closing the response unblocks that thread. It does not
+    cancel the provider request, and this function does not open another one.
+    """
+
+    if deadline is None and cancel_event is None:
+        try:
+            yield from _iter_blocking(response)
+        except (OSError, ssl.SSLError, http.client.HTTPException, TimeoutError) as exc:
             raise NetworkError(
                 f"connection broke while streaming: {exc}",
                 hint="The provider may have timed out. Retry, or use --timeout with a larger value.",
             ) from None
+        return
+
+    chunks: queue.Queue = queue.Queue()
+    errors: list[BaseException] = []
+    stop = threading.Event()
+
+    def reader() -> None:
+        # read1 returns bytes already buffered, then blocks for the next
+        # packet. A short socket timeout is never set, and a read that fails
+        # is not retried, so the buffered response cannot be poisoned.
+        try:
+            while not stop.is_set():
+                chunk = _read_available(response)
+                chunks.put(chunk)
+                if not chunk or stop.is_set():
+                    return
+        except Exception as exc:
+            if not stop.is_set():
+                errors.append(exc)
+        finally:
+            chunks.put(_READER_DONE)
+
+    thread = threading.Thread(target=reader, name="anyllm-sse", daemon=True)
+    thread.start()
+    buffer = b""
+
+    def pump(item, *, flush: bool):
+        nonlocal buffer
+        if item:
+            buffer += item
+        events, buffer = _take_events(buffer, flush=flush)
+        return _events_finished(events)
+
+    def local_stop(reason: str) -> NetworkError:
+        stop.set()
+        _wake_blocked_read(response)
+        return NetworkError(
+            reason,
+            hint="The provider may still be generating and may still charge for this "
+            "request. Stopping the local read does not cancel it on the server.",
+        )
+
+    try:
+        while True:
+            now_stopped = False
+            reason = ""
+            if cancel_event is not None and cancel_event.is_set():
+                now_stopped = True
+                reason = (
+                    "Streaming stopped locally after a cancel. "
+                    "The provider request was not cancelled."
+                )
+            elif deadline is not None and time.perf_counter() >= deadline:
+                now_stopped = True
+                reason = (
+                    "The overall deadline elapsed while streaming. "
+                    "The provider request was not cancelled."
+                )
+            if now_stopped:
+                while True:
+                    try:
+                        pending = chunks.get_nowait()
+                    except queue.Empty:
+                        break
+                    if pending is _READER_DONE:
+                        payloads, done = pump(b"", flush=False)
+                        yield from payloads
+                        if done:
+                            return
+                        break
+                    payloads, done = pump(pending if pending else b"", flush=False)
+                    yield from payloads
+                    if done:
+                        return
+                raise local_stop(reason)
+
+            wait = 0.2
+            if deadline is not None:
+                wait = min(wait, max(0.01, deadline - time.perf_counter()))
+            try:
+                item = chunks.get(timeout=wait)
+            except queue.Empty:
+                continue
+            if item is _READER_DONE:
+                payloads, _done = pump(b"", flush=not errors)
+                yield from payloads
+                if errors:
+                    exc = errors[0]
+                    raise NetworkError(
+                        f"connection broke while streaming: {exc}",
+                        hint="The provider may have timed out. Retry, or use --timeout with a larger value.",
+                    ) from None
+                if cancel_event is not None and cancel_event.is_set():
+                    raise local_stop(
+                        "Streaming stopped locally after a cancel. "
+                        "The provider request was not cancelled."
+                    )
+                if deadline is not None and time.perf_counter() >= deadline:
+                    raise local_stop(
+                        "The overall deadline elapsed while streaming. "
+                        "The provider request was not cancelled."
+                    )
+                return
+            payloads, done = pump(item, flush=False)
+            yield from payloads
+            if done or item == b"":
+                if item == b"":
+                    payloads, _done = pump(b"", flush=True)
+                    yield from payloads
+                stop.set()
+                return
+    finally:
+        stop.set()
+        _wake_blocked_read(response)
+        thread.join(timeout=1.0)
+        try:
+            response.close()
+        except Exception:
+            pass

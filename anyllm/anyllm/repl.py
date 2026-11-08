@@ -11,8 +11,14 @@ from .adapters import Usage, list_models
 from .catalog import get_provider
 from .config import ensure_config_dir, history_path, validate_max_tokens, validate_temperature
 from .errors import AnyLLMError, ConfigError
-from .keystore import KeyStore, mask_key, resolve_key
-from .targets import missing_endpoint_key, rebind_session_credentials, resolve_endpoint_key, saved_target_alias
+from .keystore import KeyStore, resolve_key
+from .targets import (
+    describe_live_key,
+    missing_endpoint_key,
+    rebind_session_credentials,
+    resolve_endpoint_key,
+    saved_target_alias,
+)
 from .seam import HELP_ROWS, REPL_HANDLERS, install_repl_features
 from .session import (
     Session,
@@ -382,6 +388,7 @@ class Repl:
             self.session.api_key = key.value
             self.session.key_source = key.source
             self.session.target_alias = None
+            self.session.explicit_endpoint = None
         else:
             # Same provider keeps the current host and target identity.
             # Re-resolve with that identity so a provider key cannot replace a target key.
@@ -506,26 +513,7 @@ class Repl:
         print(f"  provider:  {provider.name} ({provider.label})")
         print(f"  model:     {session.model}")
         print(f"  endpoint:  {session.base_url}")
-        credential, source = resolve_endpoint_key(
-            provider,
-            session.base_url,
-            target_alias=getattr(session, "target_alias", None),
-            store=self.store,
-            providers=self.providers,
-        )
-        if not provider.key_required and not credential:
-            key_text = "not needed"
-        elif source == "withheld" or not credential:
-            key_text = "withheld (non-default host)"
-        elif source.startswith("env:"):
-            key_text = f"environment ({source.split(':', 1)[1]})"
-        elif source == "saved-target":
-            key_text = f"target key ({mask_key(credential)})"
-        elif source == "saved":
-            key_text = f"saved ({mask_key(credential)})"
-        else:
-            key_text = source or "configured"
-        print(f"  key:       {key_text}")
+        print(f"  key:       {describe_live_key(session, self.providers, self.store)}")
         print(f"  system:    {session.system or '(none)'}")
         print(f"  messages:  {len(session.messages)}")
         print(f"  timeout:   {session.timeout:g}s")
@@ -533,27 +521,16 @@ class Repl:
 
     def _cmd_keys(self, _rest: str) -> None:
         provider = self.session.provider
-        credential, source = resolve_endpoint_key(
-            provider,
-            self.session.base_url,
-            target_alias=getattr(self.session, "target_alias", None),
-            store=self.store,
-            providers=self.providers,
-        )
-        if not provider.key_required and not credential:
+        label = describe_live_key(self.session, self.providers, self.store)
+        if label == "not needed":
             print(self.style.dim(f"{provider.name} does not need an API key"))
             return
-        if source == "withheld" or not credential:
+        if label.startswith("withheld"):
             print(self.style.yellow(f"{provider.name}: provider key withheld for this host"))
             alias = getattr(self.session, "target_alias", None)
             print(self.style.dim("  " + missing_endpoint_key(provider, self.session.base_url, alias).hint))
             return
-        if source.startswith("env:"):
-            print(f"{provider.name}: from environment variable {source.split(':', 1)[1]}")
-        elif source == "saved-target":
-            print(f"{provider.name}: target key {mask_key(credential)}")
-        else:
-            print(f"{provider.name}: {source} {mask_key(credential)}")
+        print(f"{provider.name}: {label}")
 
     def _cmd_save(self, rest: str) -> None:
         if not self.session.messages:

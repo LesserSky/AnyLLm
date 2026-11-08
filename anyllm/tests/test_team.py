@@ -30,6 +30,7 @@ from anyllm.team import (
     add_member,
     adopt_run,
     execute_team_ask,
+    _meta,
     fan_out,
     load_last_run,
     load_members,
@@ -142,6 +143,29 @@ class FanOutTests(unittest.TestCase):
         self.assertNotIn("super-secret-key", json.dumps(artifact))
         self.assertNotIn("super-secret-key", json.dumps(saved))
         self.assertEqual(saved["id"], artifact["id"])
+
+    def test_incomplete_status_is_not_repeated(self):
+        capped = RunResult(
+            status="incomplete",
+            incomplete=True,
+            provider="openai",
+            model="m",
+            elapsed=1.2,
+            text="partial",
+        )
+        meta = _meta(capped)
+        self.assertIn("openai/m  incomplete  ", meta)
+        self.assertNotIn("incomplete incomplete", meta)
+        failed = RunResult(
+            status="error",
+            incomplete=True,
+            provider="openai",
+            model="m",
+            elapsed=0.4,
+            error="nope",
+        )
+        self.assertIn("error incomplete", _meta(failed))
+        self.assertNotIn("incomplete incomplete", _meta(failed))
 
     def test_concurrency_is_capped_and_each_member_is_called_once(self):
         state = {"current": 0, "max": 0, "calls": 0}

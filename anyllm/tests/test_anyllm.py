@@ -872,6 +872,117 @@ class BaseUrlTests(ServerTestCase):
         self.assertIn("temperature", result.stderr.lower())
         self.assertEqual(self._posts_since(before), [])
 
+    def test_interactive_explicit_base_url_send_models_then_load_stays_strict(self):
+        home = self.temp_home()
+        url = f"{self.base}/openai/v1"
+        with mock.patch.dict(
+            os.environ,
+            {"ANYLLM_HOME": str(home), "NO_COLOR": "1", "OPENAI_API_KEY": TEST_KEY},
+            clear=False,
+        ):
+            config = load_config()
+            providers = load_providers(config)
+            store = KeyStore()
+            session = Session(
+                BUILTINS["openai"],
+                "mock",
+                base_url=url,
+                api_key=TEST_KEY,
+                key_source="env:OPENAI_API_KEY",
+                timeout=10,
+            )
+            session.explicit_endpoint = url
+            repl = Repl(session, Style(False), providers, store, config)
+            before = len(self.state.requests)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                repl._send("hi")
+            sent = self.state.requests[before:]
+            self.assertTrue(sent)
+            self.assertEqual(sent[-1]["headers"].get("Authorization"), f"Bearer {TEST_KEY}")
+            self.assertIn("Hello from mock", output.getvalue())
+            before = len(self.state.requests)
+            with redirect_stdout(io.StringIO()):
+                repl._cmd_models("")
+            listed = self.state.requests[before:]
+            self.assertTrue(any(item.get("method") == "GET" for item in listed))
+            self.assertTrue(
+                all(
+                    item["headers"].get("Authorization") == f"Bearer {TEST_KEY}"
+                    for item in listed
+                )
+            )
+            with redirect_stdout(io.StringIO()):
+                repl._cmd_save("demo")
+            saved = json.loads((home / "sessions" / "demo.json").read_text(encoding="utf-8"))
+            self.assertEqual(saved["base_url"], url)
+            self.assertNotIn("explicit_endpoint", saved)
+            self.assertNotIn(TEST_KEY, json.dumps(saved))
+            live_key = repl.session.api_key
+            with self.assertRaises(ConfigError) as caught:
+                repl._cmd_load("demo")
+            self.assertIn("Refusing to send the openai key", str(caught.exception))
+            self.assertIs(repl.session, session)
+            self.assertEqual(repl.session.api_key, live_key)
+            self.assertEqual(repl.session.explicit_endpoint, url)
+            posted = len(self.state.requests)
+            fresh = Repl(
+                Session(BUILTINS["openai"], "mock", api_key=TEST_KEY, timeout=10),
+                Style(False),
+                providers,
+                store,
+                config,
+            )
+            with self.assertRaises(ConfigError) as resumed:
+                fresh._cmd_load("demo")
+            self.assertIn("Refusing to send the openai key", str(resumed.exception))
+            self.assertFalse(hasattr(fresh.session, "explicit_endpoint") and fresh.session.explicit_endpoint)
+            self.assertEqual(self._posts_since(posted), [])
+            # The live permission is this URL only. Another host does not inherit it.
+            repl.session.base_url = "http://127.0.0.1:9/v1"
+            quiet = len(self.state.requests)
+            with self.assertRaises(ConfigError) as moved:
+                repl._send("nope")
+            self.assertIn("Refusing to send the openai key", str(moved.exception))
+            self.assertEqual(self._posts_since(quiet), [])
+
+            from anyllm.targets import add_target, repl_target
+
+            add_target(
+                "lab",
+                provider="openai",
+                model="mock",
+                base_url=url,
+                providers=providers,
+            )
+            os.environ["ANYLLM_TARGET_LAB_API_KEY"] = "target-sentinel"
+            try:
+                target_session = Session(
+                    BUILTINS["openai"],
+                    "mock",
+                    base_url=url,
+                    api_key=TEST_KEY,
+                    timeout=10,
+                )
+                target_session.explicit_endpoint = url
+                target_repl = Repl(target_session, Style(False), providers, store, config)
+                with redirect_stdout(io.StringIO()):
+                    repl_target(target_repl, "lab")
+                self.assertIsNone(target_repl.session.explicit_endpoint)
+                self.assertEqual(target_repl.session.api_key, "target-sentinel")
+                marked = len(self.state.requests)
+                with redirect_stdout(io.StringIO()):
+                    target_repl._send("hi")
+                auths = [
+                    item["headers"].get("Authorization")
+                    for item in self.state.requests[marked:]
+                    if item.get("method") == "POST"
+                ]
+                self.assertEqual(auths, ["Bearer target-sentinel"])
+                self.assertNotIn("Bearer " + TEST_KEY, auths)
+            finally:
+                os.environ.pop("ANYLLM_TARGET_LAB_API_KEY", None)
+
 
 class SamplingValidationTests(unittest.TestCase):
     def test_bounds(self):

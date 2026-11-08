@@ -81,10 +81,15 @@ not sent a tools payload.
 ## Cancellation
 
 Ctrl-C during `/team ask` stops scheduling further members and stops printing
-new tokens. `/team cancel` sets the same flag when a run is active. A socket
-read that has already started cannot be killed, so that provider call may
-still finish and may still be billed. Per-member timeouts and the overall
-deadline bound the wait. This is not a hard cancel.
+new tokens. `/team cancel` sets the same flag when a run is active. Streaming
+with a deadline or cancel flag reads the body on a daemon thread via the
+public `read1` API and the request's own timeout. Bytes already read are
+parsed before the deadline wins. A paused read is unblocked with a local
+socket shutdown, not by timing out the buffered response and reading it
+again. That shutdown does not cancel the provider request, which may still
+finish and may still be billed. This is not a hard cancel. Team workers are daemon threads
+started with `threading` and `queue`, so Ctrl-C is not stuck on a private
+thread-pool implementation.
 
 ## Integration seams for Package B
 
@@ -114,14 +119,16 @@ overwrite `keys set <provider>`. Target keys are never read from the
 provider's saved key or `ANYLLM_<PROVIDER>_API_KEY`. A non-default host
 without a target alias, including an old session file that only stored
 `base_url`, does not inherit the builtin provider key. Sessions persist
-`target` (the alias only, never the secret). `/models`, `/provider` on the
-same provider, `/load`, and CLI resume all use `resolve_endpoint_key`.
+`target` (the alias only, never the secret). `/load` and CLI resume use
+`resolve_endpoint_key` and do not accept a provider key for a non-default host.
 
 ## Explicit `--base-url` compatibility
 
 `anyllm ask`, `anyllm chat`, and `anyllm models` with `--provider NAME --base-url URL` still send NAME's usual key to that URL. That is the historical proxy and mirror behavior, kept on purpose. It is not host isolation. When URL is not NAME's configured endpoint, the command prints one stderr line and does not include the key. A normalized equivalent of the configured endpoint (host case, a trailing slash, or default port 80/443) is the same host and does not warn. Non-local plain HTTP adds that the key is not encrypted.
 
-Saved targets, `/target`, `/models` after a target, same-provider `/provider` on another host, `/load`, and CLI resume do not inherit that provider key. An old session file with a non-default host and no target alias is refused.
+That explicit command also sets an in-memory `explicit_endpoint` on the live session, so the interactive REPL's first send and `/models` keep using the provider key for that exact URL. `/save` does not write the marker or the key. `/load`, CLI resume, and a saved target do not inherit it. Switching provider or `/target` clears it. The permission is not reused for a different URL or a different provider. `/info` prints the endpoint on one line and the key state from `describe_live_key`; it does not style or redact the URL (the UI branch wraps that line).
+
+Saved targets, `/models` after a target, same-provider `/provider` on another host, `/load`, and CLI resume do not inherit that provider key. An old session file with a non-default host and no target alias is refused.
 
 Owner question: should a later version require an explicit opt-in, such as a flag or a target key, before a provider key is sent to a different host? This branch does not make that change.
 
@@ -131,10 +138,9 @@ fixed marker. It does not guarantee the model will ignore instructions inside
 the quotations.
 
 The team budget gate is USD. Prices saved in another currency are not compared
-to it and the run is refused. Cancellation stops scheduling and uses short
-socket reads so a deadline can be noticed between chunks. It does not kill the
-provider request, and team worker threads are daemons so Ctrl-C is not stuck
-waiting for them forever.
+to it and the run is refused. Cancellation stops scheduling. A deadline is
+noticed between body chunks without retrying a timed-out buffered read. It
+does not kill the provider request. Team workers are daemon threads.
 
 Team runs record target identity, the snapshot id, outputs, usage, and status.
 They do not record credentials. Attachment bodies are not stored. Path and

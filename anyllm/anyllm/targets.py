@@ -512,29 +512,91 @@ def saved_target_alias(data: dict) -> str | None:
     return raw.strip()
 
 
-def rebind_session_credentials(session, providers: dict, store: KeyStore) -> None:
-    """Refresh ``session.api_key`` from the target or host rule. Raises when required and missing."""
+def explicit_endpoint_applies(session) -> bool:
+    """True only for this process's explicit ``--base-url`` on this exact URL.
 
-    alias = getattr(session, "target_alias", None)
-    credential, source = resolve_endpoint_key(
+    The marker is not saved. A target alias, a different URL, or a loaded
+    session without the marker does not qualify.
+    """
+
+    if getattr(session, "target_alias", None):
+        return False
+    explicit = getattr(session, "explicit_endpoint", None)
+    if not isinstance(explicit, str) or not explicit.strip():
+        return False
+    return _urls_match(explicit, getattr(session, "base_url", "") or "")
+
+
+def resolve_live_credential(session, providers: dict, store: KeyStore) -> tuple[str | None, str]:
+    """Key for a live session.
+
+    An explicit ``--base-url`` on this process may use the provider key for
+    that one URL. Saved sessions and targets go through ``resolve_endpoint_key``.
+    """
+
+    if explicit_endpoint_applies(session):
+        resolution = resolve_key(session.provider, store)
+        return resolution.value, resolution.source
+    return resolve_endpoint_key(
         session.provider,
         session.base_url,
-        target_alias=alias,
+        target_alias=getattr(session, "target_alias", None),
         store=store,
         providers=providers,
     )
+
+
+def describe_live_key(session, providers: dict, store: KeyStore) -> str:
+    """One line for /info and /keys. Never includes the secret itself."""
+
+    from .keystore import mask_key
+
+    provider = session.provider
+    credential, source = resolve_live_credential(session, providers, store)
+    if not provider.key_required and not credential:
+        return "not needed"
+    if not credential or source == "withheld":
+        return "withheld (non-default host)"
+    if explicit_endpoint_applies(session) and source.startswith("env:"):
+        return f"explicit --base-url, environment ({source.split(':', 1)[1]})"
+    if explicit_endpoint_applies(session) and source == "saved":
+        return f"explicit --base-url, saved ({mask_key(credential)})"
+    if source.startswith("env:"):
+        return f"environment ({source.split(':', 1)[1]})"
+    if source == "saved-target":
+        return f"target key ({mask_key(credential)})"
+    if source == "saved":
+        return f"saved ({mask_key(credential)})"
+    if explicit_endpoint_applies(session):
+        return "explicit --base-url"
+    return source or "configured"
+
+
+def rebind_session_credentials(session, providers: dict, store: KeyStore) -> None:
+    """Refresh ``session.api_key`` from the target, explicit URL, or host rule."""
+
+    alias = getattr(session, "target_alias", None)
+    explicit = explicit_endpoint_applies(session)
+    credential, source = resolve_live_credential(session, providers, store)
     if credential:
         session.api_key = credential
         session.key_source = source
         return
-    # An in-memory key is kept only for the provider's own endpoint. A
-    # non-default host must not continue to use a provider key that was cached earlier.
-    if host_uses_provider_key(session.provider, session.base_url) and session.api_key and not alias:
+    # An in-memory key is kept only for the provider's own endpoint, and not
+    # as a stand-in for an explicit URL whose key is now missing.
+    if (
+        not explicit
+        and not alias
+        and host_uses_provider_key(session.provider, session.base_url)
+        and session.api_key
+    ):
         if not session.key_source:
             session.key_source = "session"
         return
     session.api_key = None
     session.key_source = source or "withheld"
+    if explicit and session.provider.key_required:
+        raise missing_endpoint_key(session.provider, session.provider.base_url or session.base_url, None)
     if session.provider.key_required:
         raise missing_endpoint_key(session.provider, session.base_url, alias)
 
@@ -569,6 +631,8 @@ def apply_target_to_session(session, name: str, providers: dict, store: KeyStore
     session.api_key = resolved.credential
     session.key_source = resolved.credential_source
     session.target_alias = resolved.target.alias
+    # A target is its own credential identity. Drop one-shot --base-url consent.
+    session.explicit_endpoint = None
     return resolved
 
 

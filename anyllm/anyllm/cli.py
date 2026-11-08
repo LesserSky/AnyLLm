@@ -704,6 +704,10 @@ def _build_session(
         ),
     )
     session.target_alias = target_alias
+    # In-memory only. to_dict does not write this, so /load and CLI resume
+    # do not inherit the explicit --base-url choice.
+    if not target_alias and getattr(args, "base_url", None):
+        session.explicit_endpoint = base_url
     return session
 
 

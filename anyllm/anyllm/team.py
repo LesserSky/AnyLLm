@@ -16,9 +16,7 @@ import sys
 import threading
 import time
 import uuid
-import weakref
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
-import concurrent.futures.thread as _cfthread
+from concurrent.futures import FIRST_COMPLETED, Future, wait
 from dataclasses import dataclass
 
 from .adapters import Usage
@@ -57,36 +55,71 @@ _ACTIVE = threading.Lock()
 _CANCEL: dict[str, threading.Event | None] = {"event": None}
 
 
-class _TeamPool(ThreadPoolExecutor):
-    """Pool whose workers are daemons so process exit is not stuck after Ctrl-C.
+class _TeamPool:
+    """At most ``max_workers`` daemon threads, using queue and Future only.
 
-    A daemon thread still does not cancel the provider's HTTP request.
+    No private ThreadPoolExecutor fields. A daemon still does not cancel the
+    provider's HTTP request. ``shutdown(wait=False)`` does not join; callers
+    that need a bound wait on the thread objects themselves.
     """
 
-    def _adjust_thread_count(self):
-        if self._idle_semaphore.acquire(timeout=0):
-            return
+    def __init__(self, max_workers: int) -> None:
+        self.max_workers = max(1, int(max_workers))
+        self.threads: list[threading.Thread] = []
+        self._jobs: queue.Queue = queue.Queue()
+        self._lock = threading.Lock()
+        self._closed = False
 
-        def weakref_cb(_, q=self._work_queue):
-            q.put(None)
+    def submit(self, fn, /, *args, **kwargs) -> Future:
+        future: Future = Future()
+        with self._lock:
+            if self._closed:
+                future.cancel()
+                return future
+            self._jobs.put((fn, args, kwargs, future))
+            if len(self.threads) < self.max_workers:
+                thread = threading.Thread(target=self._worker, name="anyllm-team", daemon=True)
+                thread.start()
+                self.threads.append(thread)
+        return future
 
-        num_threads = len(self._threads)
-        if num_threads < self._max_workers:
-            thread_name = "%s_%d" % (self._thread_name_prefix or self, num_threads)
-            thread = threading.Thread(
-                name=thread_name,
-                target=_cfthread._worker,
-                args=(
-                    weakref.ref(self, weakref_cb),
-                    self._work_queue,
-                    self._initializer,
-                    self._initargs,
-                ),
-                daemon=True,
-            )
-            thread.start()
-            self._threads.add(thread)
-            _cfthread._threads_queues[thread] = self._work_queue
+    def _worker(self) -> None:
+        while True:
+            item = self._jobs.get()
+            if item is None:
+                return
+            fn, args, kwargs, future = item
+            if not future.set_running_or_notify_cancel():
+                continue
+            try:
+                result = fn(*args, **kwargs)
+            except BaseException as exc:
+                future.set_exception(exc)
+            else:
+                future.set_result(result)
+
+    def shutdown(self, wait: bool = False, cancel_futures: bool = False) -> None:
+        with self._lock:
+            self._closed = True
+            leftover = []
+            while True:
+                try:
+                    leftover.append(self._jobs.get_nowait())
+                except queue.Empty:
+                    break
+            for item in leftover:
+                if item is None:
+                    continue
+                _fn, _args, _kwargs, future = item
+                if cancel_futures:
+                    future.cancel()
+                else:
+                    self._jobs.put(item)
+            for _thread in self.threads:
+                self._jobs.put(None)
+        if wait:
+            for thread in list(self.threads):
+                thread.join()
 
 
 @dataclass
@@ -409,13 +442,13 @@ def fan_out(
         executor.shutdown(wait=False, cancel_futures=True)
         if cancel_event.is_set():
             grace = time.perf_counter() + 1.0
-            for thread in list(getattr(executor, "_threads", ())):
+            for thread in list(executor.threads):
                 remaining = grace - time.perf_counter()
                 if remaining <= 0:
                     break
                 thread.join(timeout=remaining)
         else:
-            for thread in list(getattr(executor, "_threads", ())):
+            for thread in list(executor.threads):
                 thread.join()
         _bind_cancel(None)
     ordered = []
@@ -467,7 +500,10 @@ def _meta(result: RunResult) -> str:
         tokens = "usage unknown"
     else:
         tokens = f"{usage.input_tokens if usage.input_tokens is not None else '?'} in / {usage.output_tokens if usage.output_tokens is not None else '?'} out"
-    flag = " incomplete" if result.incomplete or result.status != "ok" else ""
+    # status "incomplete" already says so. Do not append the word again.
+    flag = ""
+    if result.status != "incomplete" and (result.incomplete or result.status != "ok"):
+        flag = " incomplete"
     return (
         f"{result.provider}/{result.model}  {result.status}{flag}  "
         f"{result.elapsed:.1f}s  {tokens}"

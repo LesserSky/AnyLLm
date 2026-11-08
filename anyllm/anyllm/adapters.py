@@ -13,9 +13,7 @@ from urllib.parse import quote
 
 from .catalog import ANTHROPIC, GEMINI, OPENAI, Provider
 from .errors import APIError, AuthError, ProviderError
-from .transport import bound_read_timeout, iter_sse, join_url, open_stream, request_json
-
-READ_SLICE_SECONDS = 5.0
+from .transport import iter_sse, join_url, open_stream, request_json
 
 
 @dataclass
@@ -310,22 +308,14 @@ def _content_text(value) -> str:
 
 
 def _guarded_sse(response, *, deadline, cancel_event):
-    """SSE iterator that wakes on a short read timeout when a deadline is set."""
+    """SSE iterator.
 
-    import time
+    A deadline or cancel flag is enforced between chunks by ``iter_sse``.
+    The socket timeout stays the request timeout. Short read timeouts are not
+    used: retrying one poisons Python's buffered response.
+    """
 
-    active = deadline is not None or cancel_event is not None
-    if active:
-        bound_read_timeout(response, READ_SLICE_SECONDS)
-
-    def keep_reading() -> bool:
-        if cancel_event is not None and cancel_event.is_set():
-            return False
-        if deadline is not None and time.perf_counter() >= deadline:
-            return False
-        return True
-
-    yield from iter_sse(response, keep_reading=keep_reading if active else None)
+    yield from iter_sse(response, deadline=deadline, cancel_event=cancel_event)
 
 
 def _check_base_url(base_url: str, provider: Provider) -> str:
