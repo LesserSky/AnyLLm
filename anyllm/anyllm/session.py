@@ -194,6 +194,23 @@ class Session:
             finish_reason=finish_reason,
         )
 
+    def append_exchange(self, user_text: str, assistant_text: str, *, usage: Usage | None = None) -> None:
+        """Append one finished exchange without calling a provider.
+
+        Package A uses this for ``/team adopt``. Package B can use it when the
+        user explicitly keeps a reviewed result. It does not read credentials.
+        """
+
+        if not isinstance(user_text, str) or not user_text.strip():
+            raise UsageError("The message is empty.")
+        if not isinstance(assistant_text, str) or not assistant_text.strip():
+            raise UsageError("The answer is empty.")
+        self.messages.append({"role": "user", "content": user_text})
+        self.messages.append({"role": "assistant", "content": assistant_text})
+        if usage is not None:
+            self.usage = self.usage.combined(usage)
+        self.turns += 1
+
     def to_dict(self) -> dict:
         payload = {
             "version": 1,

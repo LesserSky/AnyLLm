@@ -85,6 +85,7 @@ def _add_model_options(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="show the model's thinking stream when the provider supports it",
     )
+    parser.add_argument("--target", metavar="NAME", help="saved target alias; do not combine with --provider, --model, or --base-url")
     parser.add_argument("--no-color", action="store_true", help="disable ANSI colors")
 
 
@@ -128,7 +129,23 @@ def build_parser() -> argparse.ArgumentParser:
     ask.add_argument("prompt", nargs="*", help="prompt text; omit to read stdin")
     ask.add_argument("--json", action="store_true", dest="json_output", help="print JSON")
     ask.add_argument("--no-stream", action="store_true", help="wait for the full answer")
+    ask.add_argument(
+        "--tools",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="opt-in tool (read_attached_file); requires a successful probe",
+    )
+    ask.add_argument(
+        "--max-tool-rounds",
+        type=int,
+        default=1,
+        metavar="N",
+        help="tool rounds after the first reply (1-4)",
+    )
     ask.set_defaults(func=cmd_ask)
+
+    _add_orchestration_parsers(sub)
 
     models = sub.add_parser(
         "models",
@@ -265,6 +282,222 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.set_defaults(func=cmd_doctor)
 
     return parser
+
+
+def _add_orchestration_parsers(sub) -> None:
+    """CLI entry points for Package A. Handlers live in the feature modules."""
+
+    targets = sub.add_parser("targets", help="save named provider/model targets")
+    targets_sub = targets.add_subparsers(dest="targets_command", required=True)
+    targets_add = targets_sub.add_parser("add", help="save a target")
+    targets_add.add_argument("name")
+    targets_add.add_argument("--provider", required=True)
+    targets_add.add_argument("--model", required=True)
+    targets_add.add_argument("--base-url")
+    targets_add.add_argument("--no-color", action="store_true")
+    targets_add.set_defaults(func=cmd_targets_add)
+    targets_list = targets_sub.add_parser("list", help="list targets")
+    targets_list.add_argument("--no-color", action="store_true")
+    targets_list.set_defaults(func=cmd_targets_list)
+    targets_remove = targets_sub.add_parser("remove", help="remove a target")
+    targets_remove.add_argument("name")
+    targets_remove.add_argument("--no-color", action="store_true")
+    targets_remove.set_defaults(func=cmd_targets_remove)
+
+    prices = sub.add_parser("prices", help="save per-million token rates you supply")
+    prices_sub = prices.add_subparsers(dest="prices_command", required=True)
+    prices_set = prices_sub.add_parser("set", help="set a rate")
+    prices_set.add_argument("name")
+    prices_set.add_argument("--input", required=True, dest="input_rate")
+    prices_set.add_argument("--output", required=True, dest="output_rate")
+    prices_set.add_argument("--currency", default="USD")
+    prices_set.add_argument("--no-color", action="store_true")
+    prices_set.set_defaults(func=cmd_prices_set)
+    prices_list = prices_sub.add_parser("list", help="list rates")
+    prices_list.add_argument("--no-color", action="store_true")
+    prices_list.set_defaults(func=cmd_prices_list)
+
+    team = sub.add_parser("team", help="ask several models the same question")
+    team_sub = team.add_subparsers(dest="team_command", required=True)
+    team_ask = team_sub.add_parser("ask", help="fan out one prompt")
+    team_ask.add_argument("--member", action="append", default=[], metavar="TARGET")
+    team_ask.add_argument("--view", choices=("stacked", "columns"), default="stacked")
+    team_ask.add_argument("--merge", metavar="NAME")
+    team_ask.add_argument("--budget-usd")
+    team_ask.add_argument("--concurrency", type=int, default=2)
+    team_ask.add_argument("--timeout", type=float, default=120.0)
+    team_ask.add_argument("--deadline", type=float, default=None)
+    team_ask.add_argument("--max-tokens", type=int, default=None)
+    team_ask.add_argument("--yes", action="store_true")
+    team_ask.add_argument("prompt", nargs="+")
+    team_ask.add_argument("--no-color", action="store_true")
+    team_ask.set_defaults(func=cmd_team_ask)
+
+    capabilities = sub.add_parser("capabilities", help="probe one endpoint for an opt-in feature")
+    capabilities_sub = capabilities.add_subparsers(dest="capabilities_command", required=True)
+    probe = capabilities_sub.add_parser("probe", help="send one small probe request")
+    probe.add_argument("--target", required=True)
+    probe.add_argument("--tools", action="store_true")
+    probe.add_argument("--timeout", type=float, default=30.0)
+    probe.add_argument("--no-color", action="store_true")
+    probe.set_defaults(func=cmd_capabilities_probe)
+
+
+def cmd_targets_add(args, style: Style) -> int:
+    from .targets import add_target
+
+    config = load_config()
+    providers = load_providers(config)
+    target = add_target(
+        args.name,
+        provider=args.provider,
+        model=args.model,
+        base_url=args.base_url,
+        providers=providers,
+    )
+    print(f"added target {target.alias} → {target.provider}/{target.model}")
+    print(style.dim(f"  {target.base_url}"))
+    print(style.dim("  keys are not stored on the target"))
+    return 0
+
+
+def cmd_targets_list(args, style: Style) -> int:
+    from .targets import render_target_list
+
+    render_target_list(style)
+    return 0
+
+
+def cmd_targets_remove(args, style: Style) -> int:
+    from .targets import remove_target
+
+    remove_target(args.name)
+    print(f"removed target {args.name}")
+    return 0
+
+
+def cmd_prices_set(args, style: Style) -> int:
+    from .budgets import set_price, DOLLAR_NOTE
+
+    price = set_price(
+        args.name,
+        input_rate=args.input_rate,
+        output_rate=args.output_rate,
+        currency=args.currency,
+    )
+    print(
+        f"{price.name}: {price.input_per_million} / {price.output_per_million} "
+        f"{price.currency} per million tokens ({price.updated})"
+    )
+    print(style.dim("  " + DOLLAR_NOTE))
+    return 0
+
+
+def cmd_prices_list(args, style: Style) -> int:
+    from .budgets import load_prices, DOLLAR_NOTE
+
+    prices = load_prices()
+    if not prices:
+        print(style.dim("no saved prices"))
+        return 0
+    for name in sorted(prices):
+        price = prices[name]
+        print(
+            f"{name}: in {price.input_per_million} / out {price.output_per_million} "
+            f"{price.currency} per million ({price.updated})"
+        )
+    print(style.dim(DOLLAR_NOTE))
+    return 0
+
+
+def cmd_team_ask(args, style: Style) -> int:
+    from .team import execute_team_ask, load_members
+
+    config = load_config()
+    providers = load_providers(config)
+    store = KeyStore()
+    if args.member:
+        specs = _cli_member_specs(args.member)
+    else:
+        specs = [(item["name"], item["spec"]) for item in load_members()]
+    execute_team_ask(
+        specs=specs,
+        prompt=" ".join(args.prompt).strip(),
+        providers=providers,
+        store=store,
+        history=[],
+        system=None,
+        temperature=None,
+        max_tokens=args.max_tokens,
+        timeout=args.timeout,
+        deadline_seconds=args.deadline,
+        view=args.view,
+        merge=args.merge,
+        budget_usd=args.budget_usd,
+        concurrency=args.concurrency,
+        yes=args.yes,
+        interactive=sys.stdin.isatty(),
+        stdout_tty=sys.stdout.isatty(),
+        style=style,
+    )
+    return 0
+
+
+def _cli_member_specs(members: list[str]) -> list[tuple[str, str]]:
+    from .targets import split_provider_model, validate_alias
+
+    specs = []
+    used: set[str] = set()
+    for spec in members:
+        text = spec.strip()
+        if ":" in text:
+            provider, _model = split_provider_model(text)
+            base = provider
+        else:
+            base = validate_alias(text)
+        name = base
+        index = 2
+        while name in used:
+            name = f"{base}-{index}"
+            index += 1
+            if not name[:1].isalnum():
+                break
+        used.add(name)
+        specs.append((name, text))
+    return specs
+
+
+def cmd_capabilities_probe(args, style: Style) -> int:
+    from .targets import resolve_named
+    from .tool_protocol import probe_tools
+
+    if not args.tools:
+        raise UsageError(
+            "Name the capability to probe.",
+            hint="anyllm capabilities probe --target NAME --tools",
+        )
+    config = load_config()
+    providers = load_providers(config)
+    store = KeyStore()
+    resolved = resolve_named(args.target, providers, store)
+    print(
+        style.yellow(
+            "This sends one small request and may incur a charge. "
+            "The result applies only to this exact endpoint and model."
+        )
+    )
+    print(f"  {resolved.target.provider}/{resolved.target.model}  {resolved.target.base_url}")
+    record = probe_tools(
+        resolved.provider,
+        resolved.target,
+        credential=resolved.credential,
+        timeout=args.timeout,
+    )
+    print(f"tools: {record['tools']}")
+    print(style.dim("  " + record["detail"]))
+    if record.get("tools") == "unknown" and record.get("sent"):
+        return 1
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -415,10 +648,27 @@ def _resolve_target(
 def _build_session(
     args, config: Config, providers: dict[str, Provider], store: KeyStore
 ) -> Session:
-    provider, model, base_url = _resolve_target(args, config, providers, store)
-    key = resolve_key(provider, store)
-    if provider.key_required and not key.value:
-        raise _missing_key(provider)
+    from .targets import conflicting_target_flags, resolve_named
+
+    conflicting_target_flags(args)
+    if getattr(args, "target", None):
+        resolved = resolve_named(args.target, providers, store)
+        if resolved.http_warning:
+            print(resolved.http_warning, file=sys.stderr)
+        provider = resolved.provider
+        model = resolved.target.model
+        base_url = resolved.target.base_url
+        key_value = resolved.credential
+        key_source = resolved.credential_source
+        target_alias = resolved.target.alias
+    else:
+        provider, model, base_url = _resolve_target(args, config, providers, store)
+        key = resolve_key(provider, store)
+        if provider.key_required and not key.value:
+            raise _missing_key(provider)
+        key_value = key.value
+        key_source = key.source
+        target_alias = None
     system = args.system if args.system is not None else config.get("system")
     if system is not None and not str(system).strip():
         system = None
@@ -426,12 +676,12 @@ def _build_session(
         args.temperature if args.temperature is not None else config.get("temperature")
     )
     max_tokens = args.max_tokens if args.max_tokens is not None else config.get("max_tokens")
-    return Session(
+    session = Session(
         provider,
         model,
         base_url=base_url,
-        api_key=key.value,
-        key_source=key.source,
+        api_key=key_value,
+        key_source=key_source,
         system=None if system is None else str(system),
         temperature=validate_temperature(temperature),
         max_tokens=validate_max_tokens(max_tokens),
@@ -440,6 +690,8 @@ def _build_session(
             args.reasoning or _as_bool(config.get("show_reasoning"), "show_reasoning")
         ),
     )
+    session.target_alias = target_alias
+    return session
 
 
 def _session_from_saved(
@@ -659,6 +911,8 @@ def cmd_ask(args, style: Style) -> int:
     providers = load_providers(config)
     store = KeyStore()
     session = _build_session(args, config, providers, store)
+    if getattr(args, "tools", None):
+        return _ask_with_tools(args, session, prompt, style)
     return _ask(
         session,
         prompt,
@@ -666,6 +920,63 @@ def cmd_ask(args, style: Style) -> int:
         json_output=args.json_output,
         stream=not args.no_stream,
     )
+
+
+def _ask_with_tools(args, session: Session, prompt: str, style: Style) -> int:
+    """One ask that may call read_attached_file. Refuses when tools were not probed."""
+
+    from .seam import RunOptions, make_snapshot, attachment_store
+    from .targets import Target
+    from .tool_protocol import run_tool_conversation
+
+    target = Target(
+        provider=session.provider.name,
+        model=session.model,
+        base_url=session.base_url,
+        alias=getattr(session, "target_alias", None),
+    )
+    snapshot = make_snapshot(
+        [],
+        system=session.system,
+        temperature=session.temperature,
+        max_tokens=session.max_tokens,
+        attachments=attachment_store().list(),
+    )
+    options = RunOptions(
+        timeout=session.timeout,
+        temperature=session.temperature,
+        max_tokens=session.max_tokens,
+        show_reasoning=session.show_reasoning,
+    )
+
+    def activity(message: str) -> None:
+        print(style.dim(message), file=sys.stderr)
+
+    result = run_tool_conversation(
+        session.provider,
+        target,
+        snapshot,
+        options,
+        credential=session.api_key,
+        prompt=prompt,
+        tool_names=list(args.tools),
+        max_rounds=int(args.max_tool_rounds),
+        on_activity=activity,
+    )
+    if args.json_output:
+        payload = result.public_dict()
+        payload["tool_trace"] = list(getattr(result, "tool_trace", ()) or ())
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        if result.text:
+            sys.stdout.write(result.text)
+            if not result.text.endswith("\n"):
+                sys.stdout.write("\n")
+        if result.error and result.status != "ok":
+            print(style.red("error: ") + result.error, file=sys.stderr)
+    if result.status not in {"ok", "incomplete"}:
+        return 1
+    return 0
 
 
 def _ask(

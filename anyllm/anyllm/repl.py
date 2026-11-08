@@ -12,6 +12,7 @@ from .catalog import get_provider
 from .config import ensure_config_dir, history_path, validate_max_tokens, validate_temperature
 from .errors import AnyLLMError, ConfigError
 from .keystore import KeyStore, mask_key, resolve_key
+from .seam import HELP_ROWS, REPL_HANDLERS, install_repl_features
 from .session import (
     Session,
     Turn,
@@ -126,6 +127,7 @@ class Repl:
         self.config = config
         self.running = True
         self._readline = None
+        install_repl_features()
         self._setup_readline()
 
     # -- session plumbing ---------------------------------------------------
@@ -266,12 +268,18 @@ class Repl:
         name = parts[0].lower()
         rest = parts[1].strip() if len(parts) > 1 else ""
         handler = getattr(self, f"_cmd_{name}", None)
+        extra = None
         if handler is None:
-            print(self.style.yellow(f"unknown command /{name}"))
-            print(self.style.dim("  /help lists commands; //text sends a message starting with a slash"))
-            return
+            extra = REPL_HANDLERS.get(name)
+            if extra is None:
+                print(self.style.yellow(f"unknown command /{name}"))
+                print(self.style.dim("  /help lists commands; //text sends a message starting with a slash"))
+                return
         try:
-            handler(rest)
+            if extra is not None:
+                extra(self, rest)
+            else:
+                handler(rest)
         except AnyLLMError as exc:
             self.error(exc)
         except (ValueError, TypeError) as exc:
@@ -287,7 +295,7 @@ class Repl:
             ("/max [N]", "show or set maximum response tokens ('off' clears)"),
             ("/reasoning on|off", "show or hide the model's thinking stream"),
             ("/clear", "start a new conversation"),
-            ("/usage", "session token totals"),
+            ("/usage [--cost]", "session totals; --cost estimates from saved rates"),
             ("/info", "connection details"),
             ("/save [NAME]", "save this conversation"),
             ("/load [NAME]", "load a saved conversation (latest by default)"),
@@ -295,6 +303,7 @@ class Repl:
             ("/keys", "show which key this provider uses"),
             ("/exit", "quit"),
         ]
+        rows.extend(HELP_ROWS)
         print(self.style.bold("Commands"))
         for command, description in rows:
             print("  " + self.style.cyan(command.ljust(20)) + description)
@@ -462,7 +471,14 @@ class Repl:
         self.session.turns = 0
         print(self.style.dim("conversation cleared"))
 
-    def _cmd_usage(self, _rest: str) -> None:
+    def _cmd_usage(self, rest: str) -> None:
+        if rest.strip() == "--cost":
+            from .budgets import repl_usage_cost
+
+            repl_usage_cost(self)
+            return
+        if rest.strip():
+            raise ConfigError("Usage: /usage or /usage --cost")
         usage = self.session.usage
         if usage.total is None and not self.session.turns:
             print(self.style.dim("no requests in this session yet"))
