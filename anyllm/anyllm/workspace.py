@@ -589,7 +589,7 @@ class WorkspaceService:
             if self._emit is not None:
                 self._emit(line)
             else:
-                print(line, flush=True)
+                _print_line(line)
         return list(lines)
 
     def _ask(self, confirm, prompt: str, preamble: list[str]) -> tuple[list[str], str]:
@@ -853,6 +853,22 @@ class WorkspaceService:
         from .config import ensure_config_dir
 
         return ensure_config_dir()
+
+
+def _print_line(line: str) -> None:
+    """Print review text even when the console encoding cannot hold it."""
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+        data = (line + "\n").encode(encoding, errors="backslashreplace")
+        buffer = getattr(sys.stdout, "buffer", None)
+        if buffer is not None:
+            buffer.write(data)
+            buffer.flush()
+        else:
+            sys.stdout.write(data.decode(encoding, errors="backslashreplace"))
+            sys.stdout.flush()
 
 
 def _parse_edit_request(rest: str) -> tuple[str, str]:

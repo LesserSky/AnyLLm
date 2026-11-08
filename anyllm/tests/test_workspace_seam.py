@@ -133,7 +133,7 @@ class SeamContractTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = new_temp_dir(self)
         self.home = new_temp_dir(self)
-        (self.root / "app.py").write_text("print(1)\n", encoding="utf-8")
+        (self.root / "app.py").write_bytes(b"print(1)\n")
         self.store = Store()
         self.calls = []
         self.events = queue.Queue()
@@ -291,7 +291,7 @@ class WiredCommandTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = new_temp_dir(self)
         self.home = new_temp_dir(self)
-        (self.root / "app.py").write_text("print(1)\n", encoding="utf-8")
+        (self.root / "app.py").write_bytes(b"print(1)\n")
         self.provider = Provider(
             name="mock",
             label="Mock",

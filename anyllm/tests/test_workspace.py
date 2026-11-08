@@ -70,7 +70,7 @@ class AttachmentTests(unittest.TestCase):
         self.root = new_temp_dir(self)
         (self.root / "src").mkdir()
         self.file = self.root / "src" / "app.py"
-        self.file.write_text("print('hi')\n", encoding="utf-8")
+        self.file.write_bytes(b"print('hi')\n")
         self.workspace = Workspace(self.root)
 
     def test_add_list_show_remove_and_counts(self):
@@ -192,7 +192,10 @@ class AttachmentTests(unittest.TestCase):
 
     def test_staged_path_escapes_are_not_raw(self):
         name = "bad\x1b[2Jname.txt"
-        (self.root / name).write_text("hello\n", encoding="utf-8")
+        try:
+            (self.root / name).write_bytes(b"hello\n")
+        except OSError:
+            self.skipTest("this platform rejects control characters in file names")
         lines = "\n".join(self.workspace.add([name]))
         self.assertNotIn("\x1b", lines)
         self.assertIn("\\u001b", lines)

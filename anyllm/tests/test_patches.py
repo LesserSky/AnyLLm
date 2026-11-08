@@ -274,7 +274,7 @@ class ApplyUndoTests(unittest.TestCase):
 
     def test_unicode_diff(self):
         text = self.root / "src" / "utf.py"
-        text.write_text("café\n", encoding="utf-8")
+        text.write_bytes("café\n".encode("utf-8"))
         self.service.handle("file", "add src/utf.py")
         diff = """--- a/src/utf.py
 +++ b/src/utf.py
@@ -284,7 +284,7 @@ class ApplyUndoTests(unittest.TestCase):
 """
         self.service.handle("edit", '--format diff "x"', model_text=diff)
         self.service.handle("edit", "apply", interactive=True, confirm=lambda _prompt: "y")
-        self.assertEqual(text.read_text(encoding="utf-8"), "コーヒー\n")
+        self.assertEqual(text.read_bytes(), "コーヒー\n".encode("utf-8"))
 
     def test_multi_file_diff(self):
         other = self.root / "src" / "util.py"
