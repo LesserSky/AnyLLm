@@ -229,13 +229,65 @@ def plain_http_warning(url: str) -> str | None:
     )
 
 
+def canonical_endpoint(url: str) -> str:
+    """Normalize a base URL for host comparison. Query strings stay significant.
+
+    Host case and a default port (80 or 443) do not make a different endpoint.
+    A query, fragment, userinfo, or any other port does.
+    """
+
+    value = validate_base_url(url)
+    parts = urlsplit(value)
+    scheme = parts.scheme.lower()
+    host = (parts.hostname or "").casefold().strip("[]")
+    port = parts.port
+    default_port = 443 if scheme == "https" else 80
+    host_text = f"[{host}]" if ":" in host else host
+    if port and port != default_port:
+        netloc = f"{host_text}:{port}"
+    else:
+        netloc = host_text
+    if parts.username is not None or parts.password is not None:
+        user = parts.username or ""
+        if parts.password is not None:
+            user = f"{user}:{parts.password}"
+        netloc = f"{user}@{netloc}"
+    canonical = f"{scheme}://{netloc}{parts.path or ''}"
+    if parts.query:
+        canonical += "?" + parts.query
+    if parts.fragment:
+        canonical += "#" + parts.fragment
+    return canonical
+
+
 def _urls_match(left: str, right: str) -> bool:
     if not left or not right:
         return False
     try:
-        return validate_base_url(left) == validate_base_url(right)
+        return canonical_endpoint(left) == canonical_endpoint(right)
     except ConfigError:
         return False
+
+
+def explicit_override_warning(provider, base_url: str) -> str | None:
+    """One stderr line when an explicit ``--base-url`` sends a provider key elsewhere.
+
+    ``ask``, ``chat``, and ``models`` still forward that provider's key. This
+    only describes the choice. It is empty when the URL is the provider's own
+    endpoint, including host-case and default-port spellings, and when the
+    provider has no fixed host (the built-in ``custom`` provider). The line
+    never contains a secret.
+    """
+
+    if not base_url or host_uses_provider_key(provider, base_url):
+        return None
+    text = (
+        f"warning: --base-url {base_url} is not {provider.name}'s configured endpoint; "
+        f"this command still sends the {provider.name} key there."
+    )
+    if plain_http_warning(base_url):
+        text += " The connection is plain HTTP, so that key is not encrypted."
+    return text
 
 
 def _alias_credential(alias: str | None, store: KeyStore) -> tuple[str | None, str]:
@@ -403,12 +455,12 @@ def resolve_endpoint_key(
     store: KeyStore,
     providers: dict,
 ) -> tuple[str | None, str]:
-    """Pick the key for one host. This is the only host-aware lookup.
+    """Pick the key for a saved target, a restored session, or a live rebind.
 
     A target alias uses the target key namespace. A non-default host without
-    a target alias gets no provider key. Callers that send a request, list
-    models, restore a session, or re-bind after ``/provider`` should use this
-    instead of ``resolve_key``.
+    a target alias gets no provider key. Explicit ``ask``, ``chat``, and
+    ``models`` commands that pass ``--base-url`` are the compatibility
+    exception: they still call ``resolve_key`` and may send that provider key.
     """
 
     alias = (target_alias or "").strip() or None

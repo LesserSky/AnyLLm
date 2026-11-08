@@ -551,6 +551,125 @@ class CliTests(ServerTestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("authentication failed", result.stderr.lower())
 
+    def test_explicit_base_url_forwards_provider_key_and_warns(self):
+        home = self.temp_home()
+        url = f"{self.base}/openai/v1"
+        commands = [
+            ["ask", "--provider", "openai", "--base-url", url, "--model", "mock", "hi"],
+            ["chat", "--provider", "openai", "--base-url", url, "--model", "mock"],
+            ["models", "openai", "--base-url", url],
+        ]
+        for command in commands:
+            with self.subTest(command=command[0]):
+                before = len(self.state.requests)
+                result = self.run_cli(
+                    command,
+                    home,
+                    input_text="hi\n" if command[0] == "chat" else None,
+                    extra_env={"OPENAI_API_KEY": TEST_KEY},
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("still sends the openai key", result.stderr)
+                self.assertIn(url, result.stderr)
+                self.assertNotIn("\n", result.stderr.strip())
+                self.assertNotIn(TEST_KEY, result.stderr)
+                self.assertNotIn(TEST_KEY, result.stdout)
+                self.assertNotIn("not encrypted", result.stderr)
+                sent = self.state.requests[before:]
+                self.assertTrue(sent)
+                self.assertEqual(sent[-1]["headers"].get("Authorization"), f"Bearer {TEST_KEY}")
+
+        queried = url + "?api-version=2024-10-21"
+        before = len(self.state.requests)
+        queried_result = self.run_cli(
+            ["ask", "--provider", "openai", "--base-url", queried, "--model", "mock", "hi"],
+            home,
+            extra_env={"OPENAI_API_KEY": TEST_KEY},
+        )
+        self.assertEqual(queried_result.returncode, 0, queried_result.stderr)
+        self.assertIn("still sends the openai key", queried_result.stderr)
+        self.assertNotIn(TEST_KEY, queried_result.stderr)
+        self.assertEqual(
+            self.state.requests[before]["headers"].get("Authorization"),
+            f"Bearer {TEST_KEY}",
+        )
+
+    def test_normalized_configured_endpoint_does_not_warn(self):
+        home = self.temp_home()
+        url = f"{self.base}/openai/v1"
+        added = self.run_cli(
+            ["providers", "add", "lab", "--base-url", url, "--model", "mock"],
+            home,
+        )
+        self.assertEqual(added.returncode, 0, added.stderr)
+        keyed = self.run_cli(["keys", "set", "lab", "--stdin"], home, input_text=TEST_KEY + "\n")
+        self.assertEqual(keyed.returncode, 0, keyed.stderr)
+        before = len(self.state.requests)
+        result = self.run_cli(
+            ["ask", "--provider", "lab", "--base-url", url + "/", "--model", "mock", "hi"],
+            home,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("still sends", result.stderr)
+        self.assertEqual(
+            self.state.requests[before]["headers"].get("Authorization"),
+            f"Bearer {TEST_KEY}",
+        )
+
+    def test_target_and_saved_session_do_not_forward_the_provider_key(self):
+        home = self.temp_home()
+        url = f"{self.base}/openai/v1"
+        added = self.run_cli(
+            ["targets", "add", "lab", "--provider", "openai", "--model", "mock", "--base-url", url],
+            home,
+        )
+        self.assertEqual(added.returncode, 0, added.stderr)
+        keyed = self.run_cli(
+            ["keys", "set", "target:lab", "--stdin"],
+            home,
+            input_text=TEST_KEY + "\n",
+        )
+        self.assertEqual(keyed.returncode, 0, keyed.stderr)
+        before = len(self.state.requests)
+        asked = self.run_cli(
+            ["ask", "--target", "lab", "hi"],
+            home,
+            extra_env={"OPENAI_API_KEY": "provider-sentinel"},
+        )
+        self.assertEqual(asked.returncode, 0, asked.stderr)
+        self.assertNotIn("still sends the openai key", asked.stderr)
+        self.assertNotIn("provider-sentinel", asked.stderr)
+        self.assertNotIn("provider-sentinel", asked.stdout)
+        self.assertEqual(
+            self.state.requests[before]["headers"].get("Authorization"),
+            f"Bearer {TEST_KEY}",
+        )
+        directory = home / "sessions"
+        directory.mkdir(parents=True)
+        (directory / "old.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "provider": "openai",
+                    "model": "mock",
+                    "base_url": url,
+                    "messages": [{"role": "user", "content": "earlier"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        posted = len(self.state.requests)
+        loaded = self.run_cli(
+            ["chat", "--load", "old", "--timeout", "5"],
+            home,
+            input_text="hi\n",
+            extra_env={"OPENAI_API_KEY": "provider-sentinel"},
+        )
+        self.assertEqual(loaded.returncode, 1, loaded.stdout)
+        self.assertIn("Refusing to send the openai key", loaded.stderr)
+        self.assertNotIn("provider-sentinel", loaded.stderr)
+        self.assertEqual(self._posts_since(posted), [])
+
     def test_models_command(self):
         home = self.temp_home()
         result = self.run_cli(

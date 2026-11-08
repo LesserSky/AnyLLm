@@ -60,6 +60,11 @@ Provider keys can also come from the environment. AnyLLM checks
 ANYLLM_<PROVIDER>_API_KEY, then the provider's usual variable (for example
 OPENAI_API_KEY), then a saved key. ANYLLM_API_KEY is used only for a custom
 OpenAI-compatible endpoint, not for built-in hosts.
+
+anyllm ask, chat, and models with --provider and --base-url still send that
+provider's key to the given URL (the historical proxy/mirror override) and
+print a one-line warning when the URL is not the provider's own endpoint.
+A saved target or a resumed session does not inherit that key for a different host.
 """
 
 
@@ -669,6 +674,14 @@ def _build_session(
         key_value = key.value
         key_source = key.source
         target_alias = None
+        # Explicit --base-url keeps the provider key for proxies and mirrors.
+        # Say so when the URL is not that provider's configured endpoint.
+        if getattr(args, "base_url", None) and key_value:
+            from .targets import explicit_override_warning
+
+            note = explicit_override_warning(provider, base_url)
+            if note:
+                print(note, file=sys.stderr)
     system = args.system if args.system is not None else config.get("system")
     if system is not None and not str(system).strip():
         system = None
@@ -1083,6 +1096,12 @@ def cmd_models(args, style: Style) -> int:
     if provider.key_required and not key.value:
         raise _missing_key(provider)
     base_url = validate_base_url(args.base_url) if args.base_url else provider.base_url
+    if args.base_url and key.value:
+        from .targets import explicit_override_warning
+
+        note = explicit_override_warning(provider, base_url)
+        if note:
+            print(note, file=sys.stderr)
     models = list_models(
         provider,
         key=key.value,

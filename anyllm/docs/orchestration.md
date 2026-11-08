@@ -117,8 +117,13 @@ without a target alias, including an old session file that only stored
 `target` (the alias only, never the secret). `/models`, `/provider` on the
 same provider, `/load`, and CLI resume all use `resolve_endpoint_key`.
 
-An explicit `ask --provider NAME --base-url URL` is still that one command's
-chosen endpoint. A saved target or resumed session is not.
+## Explicit `--base-url` compatibility
+
+`anyllm ask`, `anyllm chat`, and `anyllm models` with `--provider NAME --base-url URL` still send NAME's usual key to that URL. That is the historical proxy and mirror behavior, kept on purpose. It is not host isolation. When URL is not NAME's configured endpoint, the command prints one stderr line and does not include the key. A normalized equivalent of the configured endpoint (host case, a trailing slash, or default port 80/443) is the same host and does not warn. Non-local plain HTTP adds that the key is not encrypted.
+
+Saved targets, `/target`, `/models` after a target, same-provider `/provider` on another host, `/load`, and CLI resume do not inherit that provider key. An old session file with a non-default host and no target alias is refused.
+
+Owner question: should a later version require an explicit opt-in, such as a flag or a target key, before a provider key is sent to a different host? This branch does not make that change.
 
 Quotation delimiters are a fresh `ANYLLM-QUOTE-...` token per synthesis, grown
 until it does not occur in the quoted text. That avoids a member closing a

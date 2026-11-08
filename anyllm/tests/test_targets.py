@@ -20,7 +20,10 @@ from anyllm.keystore import KeyStore
 from anyllm.targets import (
     Target,
     add_target,
+    canonical_endpoint,
     conflicting_target_flags,
+    explicit_override_warning,
+    host_uses_provider_key,
     list_target_specs,
     load_targets,
     plain_http_warning,
@@ -188,6 +191,44 @@ class TargetTests(unittest.TestCase):
             with self.assertRaises(ConfigError) as caught:
                 resolve_named("elsewhere", providers, KeyStore())
             self.assertNotIn("lab-secret", str(caught.exception))
+
+    def test_normalized_default_endpoint_is_the_same_host(self):
+        openai = BUILTINS["openai"]
+        default = openai.base_url
+        for url in (
+            default,
+            default + "/",
+            "https://API.OpenAI.com/v1",
+            "https://api.openai.com:443/v1/",
+            "HTTPS://api.openai.com/v1",
+        ):
+            with self.subTest(url=url):
+                self.assertEqual(canonical_endpoint(url), canonical_endpoint(default))
+                self.assertTrue(host_uses_provider_key(openai, url))
+                self.assertIsNone(explicit_override_warning(openai, url))
+        for url in (
+            "https://api.openai.com/v1?api-version=2024-10-21",
+            "https://api.openai.com:443/v1?x=1",
+            "http://api.openai.com/v1",
+            "https://api.openai.com:8443/v1",
+            "https://proxy.example/v1",
+            "https://user:secret@api.openai.com/v1",
+        ):
+            with self.subTest(url=url):
+                self.assertNotEqual(canonical_endpoint(url), canonical_endpoint(default))
+                self.assertFalse(host_uses_provider_key(openai, url))
+                note = explicit_override_warning(openai, url)
+                self.assertIn("still sends the openai key", note)
+                self.assertNotIn("\n", note)
+                self.assertNotIn("sk-", note)
+        remote_http = explicit_override_warning(openai, "http://proxy.example/v1")
+        self.assertIn("not encrypted", remote_http)
+        local_http = explicit_override_warning(openai, "http://127.0.0.1:9/v1")
+        self.assertIn("still sends the openai key", local_http)
+        self.assertNotIn("not encrypted", local_http)
+        custom = BUILTINS["custom"]
+        self.assertIsNone(explicit_override_warning(custom, "https://other.example/v1"))
+        self.assertTrue(host_uses_provider_key(custom, "http://proxy.example/v1?q=1"))
 
     def test_plain_http_warning_is_only_for_nonlocal_hosts(self):
         self.assertIsNone(plain_http_warning("http://127.0.0.1:1234/v1"))
