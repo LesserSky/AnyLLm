@@ -2,21 +2,31 @@
 
 from __future__ import annotations
 
+import os
 import queue
 import shutil
+import subprocess
 import sys
 import unittest
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from anyllm.catalog import OPENAI, Provider
+from anyllm.config import load_config
 from anyllm.errors import UsageError
+from anyllm.keystore import KeyStore
+from anyllm.repl import Repl
+from anyllm.session import Session
+from anyllm.term import Style
 from anyllm.workspace import WorkspaceService
 from anyllm.workspace_seam import (
+    dispatch_repl,
     SeamPort,
     TargetView,
     load_orchestration_seam,
@@ -253,6 +263,136 @@ class SeamContractTests(unittest.TestCase):
             self.assertEqual(handler.__code__.co_argcount, 2)
             self.assertIsInstance(row, tuple)
             self.assertEqual(len(row), 2)
+
+
+class WiredCommandTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.root = new_temp_dir(self)
+        self.home = new_temp_dir(self)
+        (self.root / "app.py").write_text("print(1)\n", encoding="utf-8")
+        self.provider = Provider(
+            name="mock",
+            label="Mock",
+            kind=OPENAI,
+            base_url="https://example.test/v1",
+        )
+
+    def test_repl_file_commands_do_not_send_or_write(self):
+        session = Session(self.provider, "mock", api_key="secret-key")
+        with mock.patch.dict(os.environ, {"ANYLLM_HOME": str(self.home)}):
+            repl = Repl(
+                session,
+                Style(False),
+                {"mock": self.provider},
+                KeyStore(),
+                load_config(),
+            )
+            repl.workspace_root = str(self.root)
+            lines = iter(
+                [
+                    "/file add app.py",
+                    "/file list",
+                    "/edit --format diff change the print",
+                    "/help",
+                    "/exit",
+                ]
+            )
+            import io
+            from contextlib import redirect_stdout
+
+            buf = io.StringIO()
+            with (
+                mock.patch("builtins.input", side_effect=lambda prompt="": next(lines)),
+                redirect_stdout(buf),
+            ):
+                self.assertEqual(repl.run(), 0)
+        text = buf.getvalue()
+        self.assertIn("staged app.py", text)
+        self.assertIn("app.py", text)
+        self.assertIn("Refusing to send attachments in noninteractive mode", text)
+        self.assertIn("/file ...", text)
+        self.assertNotIn("secret-key", text)
+        self.assertEqual(session.messages, [])
+        self.assertEqual((self.root / "app.py").read_text(encoding="utf-8"), "print(1)\n")
+        self.assertIsNone(load_orchestration_seam())
+
+    def test_interactive_edit_without_seam_does_not_send(self):
+        session = Session(self.provider, "mock", api_key="secret-key")
+
+        class Stub:
+            def __init__(self) -> None:
+                self.session = session
+                self.style = Style(False)
+                self.workspace_root = str(self_root)
+                self.lines: list[str] = []
+
+            def say(self, text: str = "") -> None:
+                self.lines.append(text)
+
+        self_root = self.root
+        stub = Stub()
+        with mock.patch("anyllm.workspace_seam._stdio_is_interactive", return_value=True):
+            with self.assertRaises(UsageError) as caught:
+                dispatch_repl(stub, "edit", "--format diff change the print")
+        self.assertIn("No proposal runner", str(caught.exception))
+        self.assertNotIn("secret-key", str(caught.exception))
+        self.assertEqual((self.root / "app.py").read_text(encoding="utf-8"), "print(1)\n")
+        self.assertEqual(session.messages, [])
+
+    def test_cli_preview_never_writes_or_calls_out(self):
+        proposal = self.root / "proposal.diff"
+        proposal.write_text(
+            "--- a/app.py\n+++ b/app.py\n@@ -1 +1 @@\n-print(1)\n+print(2)\n",
+            encoding="utf-8",
+        )
+        env = os.environ.copy()
+        env["ANYLLM_HOME"] = str(self.home)
+        env["NO_COLOR"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+        for name in list(env):
+            if name.endswith("_API_KEY") or name.startswith("ANYLLM_"):
+                if name != "ANYLLM_HOME":
+                    env.pop(name, None)
+        env["ANYLLM_HOME"] = str(self.home)
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "anyllm",
+                "edit",
+                "--root",
+                str(self.root),
+                "--file",
+                "app.py",
+                "--format",
+                "diff",
+                "--proposal-file",
+                str(proposal),
+                "change the print",
+            ],
+            cwd=str(ROOT),
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Not applied", result.stdout)
+        self.assertIn("print(2)", result.stdout)
+        self.assertNotIn("\x1b", result.stdout)
+        self.assertNotIn("secret", result.stdout)
+        self.assertEqual((self.root / "app.py").read_text(encoding="utf-8"), "print(1)\n")
+        listed = subprocess.run(
+            [sys.executable, "-m", "anyllm", "undo", "--root", str(self.root), "last"],
+            cwd=str(ROOT),
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        self.assertNotEqual(listed.returncode, 0)
+        self.assertIn("No applied edit", listed.stderr + listed.stdout)
+        self.assertEqual((self.root / "app.py").read_text(encoding="utf-8"), "print(1)\n")
 
 
 if __name__ == "__main__":

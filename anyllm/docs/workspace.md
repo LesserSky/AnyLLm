@@ -106,6 +106,22 @@ still match the applied bytes.
 Backups can contain source, including secrets that were in that source. They
 are not uploaded, pruned, or deleted by this version.
 
+## Commands wired on this branch
+
+`/file`, `/edit`, and `/undo` are dispatched by the REPL. `anyllm file`,
+`anyllm edit`, and `anyllm undo` are the noninteractive CLI.
+
+`/file` and `anyllm file` only stage files. They do not call a provider.
+`/edit` without Package A's seam refuses before any network call and writes
+nothing. The CLI `edit` command requires `--proposal-file` and always passes
+`interactive=False`, so it previews and does not write. `anyllm undo last`
+prints the refusal and does not restore. An interactive terminal can still
+answer `y` to `/edit apply` or `/undo last` inside the REPL.
+
+Generating a proposal from the live session is not available until
+`anyllm.seam.run_request` is installed. Do not treat `/edit` as able to call
+a model on this branch.
+
 ## Package A seam
 
 `feat/orchestration` (pull request 3) was read remotely and is not merged here.

@@ -339,6 +339,9 @@ class Repl:
             ("/load [NAME]", "load a saved conversation (latest by default)"),
             ("/sessions", "list saved conversations"),
             ("/keys", "show which key this provider uses"),
+            ("/file ...", "stage files under the workspace root"),
+            ("/edit ...", "preview an edit; a model call needs the seam"),
+            ("/undo ...", "list backups or restore after y"),
             ("/exit", "quit"),
         ]
         print(self.style.bold("Commands"))
@@ -616,6 +619,21 @@ class Repl:
         for line in format_table(self.style, ["NAME", "TARGET", "SIZE", "UPDATED"], rows):
             print(line)
         print()
+
+    def _cmd_file(self, rest: str) -> None:
+        from .workspace_seam import dispatch_repl
+
+        dispatch_repl(self, "file", rest)
+
+    def _cmd_edit(self, rest: str) -> None:
+        from .workspace_seam import dispatch_repl
+
+        dispatch_repl(self, "edit", rest)
+
+    def _cmd_undo(self, rest: str) -> None:
+        from .workspace_seam import dispatch_repl
+
+        dispatch_repl(self, "undo", rest)
 
     def _cmd_exit(self, _rest: str) -> None:
         self.running = False

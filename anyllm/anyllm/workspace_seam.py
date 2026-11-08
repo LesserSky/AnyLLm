@@ -274,33 +274,58 @@ def bind_service(service, repl) -> bool:
     return True
 
 
+def dispatch_repl(repl, command: str, rest: str) -> None:
+    """Handle one workspace slash command on the main thread.
+
+    Proposal generation uses the seam only when ``bind_service`` finds it.
+    Otherwise ``/edit`` refuses before any network call. Apply and undo write
+    only when both stdin and stdout are terminals and the user answers ``y``.
+    """
+
+    service = getattr(repl, "_workspace_service", None)
+    if service is None:
+        root = getattr(repl, "workspace_root", None) or "."
+        service = __import__(
+            "anyllm.workspace", fromlist=["WorkspaceService"]
+        ).WorkspaceService(
+            root,
+            style=getattr(repl, "style", None),
+            destination=_destination(repl),
+        )
+        repl._workspace_service = service
+        bind_service(service, repl)
+        for line in service.recovery_lines():
+            present_lines([line], repl)
+    interactive = _stdio_is_interactive()
+
+    def confirm(prompt: str) -> str:
+        return input(prompt)
+
+    lines = service.handle(command, rest, interactive=interactive, confirm=confirm)
+    if service.seam is not None:
+        drain_events(service.seam.event_queue, getattr(repl, "presentation", None))
+    present_lines(lines, repl)
+
+
+def _destination(repl) -> str:
+    session = getattr(repl, "session", None)
+    provider = getattr(session, "provider", None)
+    name = getattr(provider, "name", "")
+    return name or ""
+
+
+def _stdio_is_interactive() -> bool:
+    import sys
+
+    try:
+        return bool(sys.stdin.isatty() and sys.stdout.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
 def _repl_command(command: str):
     def handler(repl, rest: str) -> None:
-        service = getattr(repl, "_workspace_service", None)
-        if service is None:
-            root = getattr(repl, "workspace_root", None) or "."
-            service = __import__(
-                "anyllm.workspace", fromlist=["WorkspaceService"]
-            ).WorkspaceService(root, style=getattr(repl, "style", None))
-            repl._workspace_service = service
-            bind_service(service, repl)
-            for line in service.recovery_lines():
-                present_lines([line], repl)
-        interactive = False
-        try:
-            import sys
-
-            interactive = bool(sys.stdin.isatty() and sys.stdout.isatty())
-        except (AttributeError, ValueError):
-            interactive = False
-
-        def confirm(prompt: str) -> str:
-            return input(prompt)
-
-        lines = service.handle(command, rest, interactive=interactive, confirm=confirm)
-        if service.seam is not None:
-            drain_events(service.seam.event_queue, getattr(repl, "presentation", None))
-        present_lines(lines, repl)
+        dispatch_repl(repl, command, rest)
 
     return handler
 
@@ -309,18 +334,24 @@ def wiring_notes() -> str:
     """Later coordinator steps. Not executed on this branch."""
 
     return """\
-After feat/orchestration is merged, and only with approval to publish:
+This branch already dispatches /file, /edit, and /undo from repl.py through
+dispatch_repl. The CLI commands file, edit, and undo never set interactive
+mode, so they cannot write source files. /edit does not call a provider
+until anyllm.seam is installed; bind_service returns false without it.
+
+After feat/orchestration is merged:
 
 1. Do not copy seam.py. Import anyllm.seam.
-2. Call register_workspace(register_repl) from the same place that calls
-   install_repl_features, or immediately after it. Handlers are (repl, rest).
-3. Give the REPL a Presentation and pass it as repl.presentation so previews
-   use Presentation.block and RunEvent status uses status_line on the main thread.
-4. bind_service(service, repl) publishes consent with attachment_store().approve
-   and sends the proposal with run_request. Credential stays a keyword argument.
+2. Keep the repl.py _cmd_file/_cmd_edit/_cmd_undo dispatch. Do not also
+   register_workspace(register_repl) for those same names, or a REPL that
+   checks both tables could run the command twice.
+3. Give the REPL a Presentation as repl.presentation so previews use
+   Presentation.block and RunEvent status uses status_line on the main thread.
+4. bind_service already publishes consent with attachment_store().approve
+   and sends the proposal with run_request when the seam imports. The
+   credential stays a keyword argument.
 5. Do not call Session.append_exchange for a proposal. File bodies stay out of
    Session.messages unless a later command explicitly adopts text.
 6. load_feature/save_feature stay for Package A JSON. Edit journals remain under
    ANYLLM_HOME/edits and are not feature files.
-7. Leave feat/orchestration and its pull request unchanged until that merge.
 """
