@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 from datetime import datetime
 
 from . import __version__
@@ -30,31 +31,90 @@ from .session import (
     save_session,
     session_base_url,
 )
+from .term import (
+    format_error,
+    format_reply_status,
+    format_table,
+    is_tty,
+    redact_endpoint,
+    startup_banner,
+)
 
 
 class StreamPrinter:
-    """Render streamed text, with light styling for fenced code blocks."""
+    """Render streamed text, with light styling for fenced code blocks.
+
+    A spinner runs until the first token when ``spinner`` is true. Callers
+    leave it off for pipes so stdout stays the answer text alone.
+    """
 
     def __init__(self, style, show_reasoning: bool = False, spinner: bool = True) -> None:
         self.style = style
         self.show_reasoning = show_reasoning
-        self.spinner = spinner and style.enabled
+        self.spinner = bool(spinner)
+        self._ansi = bool(style.enabled)
         self.in_code = False
         self.wrote_text = False
         self.wrote_reasoning = False
         self._indicator = False
         self._last = ""
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
 
     def begin(self) -> None:
-        if self.spinner:
-            sys.stdout.write(self.style.dim("…"))
+        if not self.spinner or self._thread is not None:
+            return
+        self._stop.clear()
+        self._indicator = True
+        self._thread = threading.Thread(
+            target=self._spin, name="anyllm-spinner", daemon=True
+        )
+        self._thread.start()
+
+    def _spin(self) -> None:
+        frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏" if self._ansi else "|/-\\"
+        index = 0
+        while not self._stop.is_set():
+            frame = frames[index % len(frames)]
+            index += 1
+            with self._lock:
+                if self._stop.is_set():
+                    return
+                try:
+                    if self._ansi:
+                        sys.stdout.write("\r" + self.style.accent(frame) + "\x1b[K")
+                    else:
+                        sys.stdout.write("\r" + frame)
+                    sys.stdout.flush()
+                except Exception:
+                    return
+            if self._stop.wait(0.08):
+                return
+
+    def _write(self, value: str) -> None:
+        with self._lock:
+            sys.stdout.write(value)
             sys.stdout.flush()
-            self._indicator = True
 
     def _clear_indicator(self) -> None:
+        if not self._indicator and self._thread is None:
+            return
+        self._stop.set()
+        thread = self._thread
+        self._thread = None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
         if self._indicator:
-            sys.stdout.write("\r\x1b[2K")
-            sys.stdout.flush()
+            with self._lock:
+                try:
+                    if self._ansi:
+                        sys.stdout.write("\r\x1b[2K")
+                    else:
+                        sys.stdout.write("\r \r")
+                    sys.stdout.flush()
+                except Exception:
+                    pass
             self._indicator = False
 
     def text(self, value: str) -> None:
@@ -63,12 +123,11 @@ class StreamPrinter:
         self._clear_indicator()
         if self.show_reasoning and self.wrote_reasoning and not self.wrote_text:
             if self._last and self._last != "\n":
-                sys.stdout.write("\n")
+                self._write("\n")
         if self.style.enabled:
             self._write_styled(value)
         else:
-            sys.stdout.write(value)
-            sys.stdout.flush()
+            self._write(value)
         self.wrote_text = True
         self._last = value[-1]
 
@@ -80,9 +139,9 @@ class StreamPrinter:
             self.wrote_reasoning = True
             return
         if not self.wrote_reasoning:
-            sys.stdout.write(self.style.dim("thinking\n"))
-        sys.stdout.write(self.style.dim(value))
-        sys.stdout.flush()
+            # A plain label, then dim italic text, so thinking is not the answer.
+            self._write(self.style.muted("reasoning:\n"))
+        self._write(self.style.reasoning(value))
         self.wrote_reasoning = True
         self._last = value[-1]
 
@@ -102,15 +161,13 @@ class StreamPrinter:
             return
         in_code = self.in_code if code is None else code
         if in_code:
-            value = self.style.grey(value)
-        sys.stdout.write(value)
-        sys.stdout.flush()
+            value = self.style.code(value)
+        self._write(value)
 
     def end(self) -> None:
         self._clear_indicator()
         if self._last and self._last != "\n":
-            sys.stdout.write("\n")
-            sys.stdout.flush()
+            self._write("\n")
 
 
 def _format_when(value: str | None) -> str:
@@ -166,16 +223,14 @@ class Repl:
             pass
 
     def _prompt(self) -> str:
-        if self.style.enabled:
-            return self.style.bold(self.style.cyan("you")) + self.style.cyan(" › ")
-        return "you> "
+        return self.style.prompt("you> ", readline=self._readline is not None)
 
     def _read_input(self) -> str:
         prompt = self._prompt()
         line = input(prompt)
         while line.rstrip().endswith("\\"):
             line = line.rstrip()[:-1] + "\n"
-            continuation = self.style.dim("... ") if self.style.enabled else "... "
+            continuation = self.style.prompt("... ", readline=self._readline is not None)
             line += input(continuation)
         return line
 
@@ -185,18 +240,19 @@ class Repl:
         print(text)
 
     def error(self, exc: AnyLLMError) -> None:
-        print(self.style.red("error: ") + exc.message)
-        if exc.hint:
-            print(self.style.dim("  " + exc.hint))
+        for line in format_error(self.style, exc):
+            print(line)
 
     def _banner(self) -> None:
-        title = self.style.bold("AnyLLM") + self.style.dim(
-            f" {__version__}  ·  {self.session.provider.name}/{self.session.model}"
-        )
-        print()
-        print(title)
-        print(self.style.dim("Type /help for commands, /exit to quit."))
-        print()
+        endpoint = redact_endpoint(self.session.base_url, self.session.api_key)
+        for line in startup_banner(
+            self.style,
+            version=__version__,
+            provider=self.session.provider.name,
+            model=self.session.model,
+            endpoint=endpoint,
+        ):
+            print(line)
 
     # -- main loop ----------------------------------------------------------
 
@@ -230,7 +286,7 @@ class Repl:
         printer = StreamPrinter(
             self.style,
             show_reasoning=self.session.show_reasoning,
-            spinner=True,
+            spinner=is_tty(),
         )
         printer.begin()
         try:
@@ -253,17 +309,7 @@ class Repl:
         print()
 
     def _stats(self, turn: Turn) -> str:
-        pieces = [f"{turn.elapsed:.1f}s"]
-        usage = turn.usage
-        if usage.input_tokens is not None:
-            pieces.append(f"{usage.input_tokens} in")
-        if usage.output_tokens is not None:
-            pieces.append(f"{usage.output_tokens} out")
-        if usage.reasoning_tokens:
-            pieces.append(f"{usage.reasoning_tokens} reasoning")
-        if usage.total is None:
-            pieces.append("tokens n/a")
-        return self.style.dim("  " + " · ".join(pieces))
+        return format_reply_status(self.style, turn.elapsed, turn.usage)
 
     # -- commands -----------------------------------------------------------
 
@@ -295,6 +341,7 @@ class Repl:
 
     def _cmd_help(self, _rest: str) -> None:
         rows = [
+            ("/help", "show this list"),
             ("/model NAME", "switch model"),
             ("/models [TEXT]", "list models available to this key"),
             ("/provider [NAME]", "switch provider, keeping the conversation"),
@@ -313,10 +360,11 @@ class Repl:
         ]
         rows.extend(HELP_ROWS)
         print(self.style.bold("Commands"))
-        for command, description in rows:
-            print("  " + self.style.cyan(command.ljust(20)) + description)
+        for line in format_table(self.style, ["COMMAND", "ACTION"], rows):
+            print("  " + line)
         print()
-        print(self.style.dim("  End a line with \\ to continue on the next line."))
+        print(self.style.muted("  End a line with \\ to continue on the next line."))
+        print(self.style.muted("  //text sends a message that starts with a slash."))
         print()
 
     def _cmd_model(self, rest: str) -> None:
@@ -342,9 +390,10 @@ class Repl:
         if not models:
             print(self.style.yellow("no matching models were returned"))
             return
+        shown = models[:200]
         print(self.style.bold(f"Models ({len(models)})"))
-        for name in models[:200]:
-            print("  " + name)
+        for line in format_table(self.style, ["MODEL"], [[name] for name in shown]):
+            print(line)
         if len(models) > 200:
             print(self.style.dim(f"  … and {len(models) - 200} more"))
         print()
@@ -353,6 +402,7 @@ class Repl:
         if not rest:
             print(f"provider: {self.style.bold(self.session.provider.name)}")
             print(self.style.dim("  available:"))
+            rows = []
             for name in sorted(self.providers):
                 provider = self.providers[name]
                 key = resolve_key(provider, self.store)
@@ -362,8 +412,12 @@ class Repl:
                     status = key.display
                 else:
                     status = "no key"
-                marker = "*" if name == self.session.provider.name else " "
-                print(f"  {marker} {name.ljust(12)} {provider.kind.ljust(10)} {status}")
+                label = f"{name} *" if name == self.session.provider.name else name
+                rows.append((label, provider.kind, status))
+            for line in format_table(self.style, ["PROVIDER", "KIND", "KEY"], rows):
+                print("  " + line)
+            print(self.style.dim("  * current provider"))
+            print()
             return
 
         provider = get_provider(rest, self.providers)
@@ -510,9 +564,10 @@ class Repl:
         session = self.session
         provider = session.provider
         print(self.style.bold("Connection"))
-        print(f"  provider:  {provider.name} ({provider.label})")
-        print(f"  model:     {session.model}")
-        print(f"  endpoint:  {session.base_url}")
+        print(f"  provider:  {self.style.bold(provider.name)} ({provider.label})")
+        print(f"  model:     {self.style.bold(session.model)}")
+        endpoint = redact_endpoint(session.base_url, session.api_key)
+        print(f"  endpoint:  {self.style.muted(endpoint)}")
         print(f"  key:       {describe_live_key(session, self.providers, self.store)}")
         print(f"  system:    {session.system or '(none)'}")
         print(f"  messages:  {len(session.messages)}")
@@ -591,13 +646,17 @@ class Repl:
             print(self.style.dim("no saved sessions"))
             return
         print(self.style.bold("Saved sessions"))
-        for entry in entries[:20]:
-            print(
-                "  "
-                + self.style.cyan(entry["name"].ljust(22))
-                + f"{entry['provider']}/{entry['model']}  "
-                + self.style.dim(f"{entry['messages']} msg · {_format_when(entry['updated'])}")
-            )
+        rows = [
+            [
+                entry["name"],
+                f"{entry['provider']}/{entry['model']}",
+                f"{entry['messages']} msg",
+                _format_when(entry["updated"]),
+            ]
+            for entry in entries[:20]
+        ]
+        for line in format_table(self.style, ["NAME", "TARGET", "SIZE", "UPDATED"], rows):
+            print(line)
         print()
 
     def _cmd_exit(self, _rest: str) -> None:
