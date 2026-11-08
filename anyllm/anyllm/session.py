@@ -174,11 +174,19 @@ class Session:
             raise
 
         answer = "".join(text_parts)
+        reasoning = "".join(thought_parts)
         if not answer.strip():
             self.messages.pop()
             notice = finish_notice(finish_reason)
+            if notice:
+                raise ProviderError(notice.capitalize(), hint="The finish reason is the evidence for that limit.")
+            if reasoning.strip():
+                raise ProviderError(
+                    "The model returned reasoning but no answer text.",
+                    hint="That does not by itself show that the output cap was hit.",
+                )
             raise ProviderError(
-                notice.capitalize() if notice else "The provider returned an empty response.",
+                "The provider returned an empty response.",
                 hint="Try another model with /model, or rephrase the prompt.",
             )
 
@@ -233,6 +241,10 @@ class Session:
         # Always record a resolved endpoint. Old files simply omit this key.
         if isinstance(self.base_url, str) and self.base_url.strip():
             payload["base_url"] = self.base_url
+        # Identity only. The key stays in the key store or the environment.
+        alias = getattr(self, "target_alias", None)
+        if isinstance(alias, str) and alias.strip():
+            payload["target"] = alias.strip()
         return payload
 
 

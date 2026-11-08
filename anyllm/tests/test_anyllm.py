@@ -612,7 +612,16 @@ class BaseUrlTests(ServerTestCase):
         home = self.temp_home()
         with mock.patch.dict(os.environ, {"ANYLLM_HOME": str(home)}):
             store = KeyStore()
-            store.set("mock", TEST_KEY)
+            store.set("target:azureish", TEST_KEY)
+            from anyllm.targets import add_target
+
+            add_target(
+                "azureish",
+                provider="mock",
+                model="mock",
+                base_url=custom,
+                providers={"mock": provider},
+            )
             session = Session(
                 provider,
                 "mock",
@@ -621,6 +630,7 @@ class BaseUrlTests(ServerTestCase):
                 temperature=0.0,
                 max_tokens=8,
             )
+            session.target_alias = "azureish"
             session.messages = [
                 {"role": "user", "content": "hi"},
                 {"role": "assistant", "content": "yo"},
@@ -659,10 +669,10 @@ class BaseUrlTests(ServerTestCase):
 
             args.base_url = "http://127.0.0.1:9/v1"
             with redirect_stdout(io.StringIO()):
-                overridden = _session_from_saved(
-                    "demo", args, {"mock": provider}, store, Style(False)
-                )
-            self.assertEqual(overridden.base_url, "http://127.0.0.1:9/v1")
+                with self.assertRaises(ConfigError) as moved:
+                    _session_from_saved("demo", args, {"mock": provider}, store, Style(False))
+            self.assertIn("127.0.0.1:9", str(moved.exception))
+            self.assertNotIn(TEST_KEY, str(moved.exception))
 
     def test_old_session_without_base_url_uses_provider_default(self):
         provider = Provider(
@@ -714,14 +724,9 @@ class BaseUrlTests(ServerTestCase):
             input_text="hi\n",
             extra_env={"OPENAI_API_KEY": TEST_KEY},
         )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Hello from mock", result.stdout)
-        self.assertIn("resumed demo", result.stdout)
-        posts = self._posts_since(before)
-        self.assertEqual(len(posts), 1)
-        self.assertEqual(posts[0]["path"], "/openai/v1/chat/completions")
-        roles = [item["role"] for item in posts[0]["payload"]["messages"]]
-        self.assertEqual(roles, ["user", "assistant", "user"])
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("Refusing to send the openai key", result.stderr)
+        self.assertEqual(self._posts_since(before), [])
 
     def test_chat_load_rejects_bad_sampling_before_request(self):
         home = self.temp_home()
@@ -985,11 +990,13 @@ class ProviderCommandTests(ServerTestCase):
             self.assertEqual(repl.session.messages[0]["content"], "keep me")
 
             with redirect_stdout(output):
-                repl._cmd_provider("openai")
+                with self.assertRaises(ConfigError) as withheld:
+                    repl._cmd_provider("openai")
+            self.assertIn("Refusing to send", str(withheld.exception))
             self.assertEqual(repl.session.provider.name, "openai")
             self.assertEqual(repl.session.base_url, "https://proxy.example/v1")
             self.assertEqual(repl.session.model, "gpt-custom")
-            self.assertEqual(repl.session.api_key, "sk-openai")
+            self.assertIsNone(repl.session.api_key)
 
             held = os.environ.pop("GROQ_API_KEY")
             try:

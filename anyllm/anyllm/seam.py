@@ -337,6 +337,8 @@ def run_request(
             max_tokens=max_tokens,
             timeout=timeout,
             tools=options.tools_payload,
+            deadline=options.deadline,
+            cancel_event=cancel_event,
         ):
             if cancel_event is not None and cancel_event.is_set():
                 elapsed = time.perf_counter() - started
@@ -373,7 +375,14 @@ def run_request(
     except ProviderError as exc:
         return _finished_error("error", target, exc, started, text_parts, thought_parts, usage, finish_reason, deltas)
     except NetworkError as exc:
-        status = "timeout" if "timed out" in str(exc).lower() else "error"
+        if cancel_event is not None and cancel_event.is_set():
+            status = "cancelled"
+        elif options.deadline is not None and time.perf_counter() >= options.deadline:
+            status = "timeout"
+        elif "timed out" in str(exc).lower() or "deadline" in str(exc).lower():
+            status = "timeout"
+        else:
+            status = "error"
         return _finished_error(status, target, exc, started, text_parts, thought_parts, usage, finish_reason, deltas)
     except AnyLLMError as exc:
         return _finished_error("error", target, exc, started, text_parts, thought_parts, usage, finish_reason, deltas)
@@ -395,14 +404,30 @@ def run_request(
         )
 
     text = "".join(text_parts)
-    incomplete = finish_reason in {"length", "max_tokens", "max_completion_tokens"}
+    reasoning = "".join(thought_parts)
+    length_capped = finish_reason in {"length", "max_tokens", "max_completion_tokens"}
+    incomplete = length_capped
     status = "incomplete" if incomplete and not deltas else "ok"
+    error = None
     if not text.strip() and not deltas:
-        status = "error"
-        error = "The provider returned an empty response."
-        incomplete = True
-    else:
-        error = None
+        if length_capped:
+            # finish_reason is evidence the output cap stopped the reply.
+            status = "incomplete"
+            error = "The output cap was exhausted before any answer text."
+            if reasoning.strip():
+                error += " Reasoning was returned."
+            incomplete = True
+        elif reasoning.strip():
+            status = "incomplete"
+            error = (
+                "The model returned reasoning but no answer text. "
+                "That does not by itself show that the output cap was hit."
+            )
+            incomplete = True
+        else:
+            status = "error"
+            error = "The provider returned an empty response."
+            incomplete = True
     elapsed = time.perf_counter() - started
     _emit(event_queue, RunEvent("status", label, status))
     return RunResult(

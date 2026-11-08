@@ -29,6 +29,7 @@ from .seam import (
 
 READ_ATTACHED_FILE = "read_attached_file"
 MAX_TOOL_ROUNDS = 4
+MAX_TOOL_CALLS_PER_ROUND = 8
 ARGUMENT_BYTE_CAP = 8 * 1024
 RESULT_BYTE_CAP = 32 * 1024
 
@@ -170,6 +171,14 @@ def assemble_tool_calls(deltas) -> list[AssembledCall]:
         arguments = getattr(delta, "arguments", "") or ""
         if arguments:
             slot["arguments"] += arguments
+            if len(slot["arguments"].encode("utf-8")) > ARGUMENT_BYTE_CAP:
+                raise ToolInputError(
+                    "Tool arguments exceeded 8192 bytes while they were still streaming."
+                )
+        if len(slots) > MAX_TOOL_CALLS_PER_ROUND:
+            raise ToolInputError(
+                f"More than {MAX_TOOL_CALLS_PER_ROUND} tool calls arrived in one round."
+            )
     calls = []
     seen: set[str] = set()
     for index in order:

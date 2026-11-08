@@ -439,12 +439,49 @@ def _iter_sse(response):
         yield payload
 
 
-def iter_sse(response):
-    """Yield decoded SSE data payloads, translating read errors."""
+def bound_read_timeout(response, seconds: float) -> bool:
+    """Best-effort cap on later socket reads. Returns whether a socket was found.
+
+    This does not abort a request the server has already accepted. It only
+    asks the local socket to wake up so cancellation and the overall deadline
+    can be noticed between reads.
+    """
+
+    fp = getattr(response, "fp", None)
+    raw = getattr(fp, "raw", None)
+    sock = getattr(raw, "_sock", None)
+    if sock is None or not hasattr(sock, "settimeout"):
+        return False
     try:
-        yield from _iter_sse(response)
-    except (OSError, TimeoutError, ssl.SSLError, http.client.HTTPException) as exc:
-        raise NetworkError(
-            f"connection broke while streaming: {exc}",
-            hint="The provider may have timed out. Retry, or use --timeout with a larger value.",
-        ) from None
+        sock.settimeout(max(0.1, float(seconds)))
+    except OSError:
+        return False
+    return True
+
+
+def iter_sse(response, *, keep_reading=None):
+    """Yield decoded SSE data payloads, translating read errors.
+
+    ``keep_reading`` may return true after a short socket timeout so the
+    caller can keep waiting until its own deadline. A false result, or no
+    callback, ends the stream. This is cooperative: it does not promise to
+    stop the provider.
+    """
+
+    while True:
+        try:
+            yield from _iter_sse(response)
+            return
+        except (socket.timeout, TimeoutError) as exc:
+            if keep_reading is not None and keep_reading():
+                continue
+            raise NetworkError(
+                f"connection broke while streaming: {exc}",
+                hint="The local read timed out. The provider may still be generating; "
+                "this does not cancel the request on the server.",
+            ) from None
+        except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
+            raise NetworkError(
+                f"connection broke while streaming: {exc}",
+                hint="The provider may have timed out. Retry, or use --timeout with a larger value.",
+            ) from None

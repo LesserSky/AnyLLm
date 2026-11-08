@@ -444,7 +444,7 @@ def cmd_team_ask(args, style: Style) -> int:
 
 
 def _cli_member_specs(members: list[str]) -> list[tuple[str, str]]:
-    from .targets import split_provider_model, validate_alias
+    from .targets import normalize_alias, split_provider_model
 
     specs = []
     used: set[str] = set()
@@ -454,7 +454,7 @@ def _cli_member_specs(members: list[str]) -> list[tuple[str, str]]:
             provider, _model = split_provider_model(text)
             base = provider
         else:
-            base = validate_alias(text)
+            base = normalize_alias(text)
         name = base
         index = 2
         while name in used:
@@ -701,11 +701,17 @@ def _session_from_saved(
     store: KeyStore,
     style: Style,
 ) -> Session:
+    from .targets import (
+        host_uses_provider_key,
+        missing_endpoint_key,
+        resolve_endpoint_key,
+        resolve_named,
+        saved_target_alias,
+        _urls_match,
+    )
+
     data = load_session_data(name)
     provider = get_provider(str(data.get("provider")), providers)
-    key = resolve_key(provider, store)
-    if provider.key_required and not key.value:
-        raise _missing_key(provider)
     model = args.model or data.get("model") or provider.default_model
     if not model:
         raise ConfigError(
@@ -715,16 +721,37 @@ def _session_from_saved(
     system = args.system if args.system is not None else data.get("system")
     if system is not None and not str(system).strip():
         system = None
-    temperature = (
+    temperature = validate_temperature(
         args.temperature if args.temperature is not None else data.get("temperature")
     )
-    max_tokens = args.max_tokens if args.max_tokens is not None else data.get("max_tokens")
+    max_tokens = validate_max_tokens(
+        args.max_tokens if args.max_tokens is not None else data.get("max_tokens")
+    )
+    base_url = session_base_url(data, provider, getattr(args, "base_url", None))
+    alias = saved_target_alias(data)
+    # An explicit --base-url on resume is a new host. Drop the saved target
+    # identity when it would no longer match, instead of sending that key elsewhere.
+    if getattr(args, "base_url", None) and alias:
+        named = resolve_named(alias, providers, store, require_credential=False)
+        if not _urls_match(base_url, named.target.base_url):
+            alias = None
+    credential, source = resolve_endpoint_key(
+        provider,
+        base_url,
+        target_alias=alias,
+        store=store,
+        providers=providers,
+    )
+    if provider.key_required and not credential:
+        if alias or not host_uses_provider_key(provider, base_url):
+            raise missing_endpoint_key(provider, base_url, alias)
+        raise _missing_key(provider)
     session = Session(
         provider,
         str(model),
-        base_url=session_base_url(data, provider, getattr(args, "base_url", None)),
-        api_key=key.value,
-        key_source=key.source,
+        base_url=base_url,
+        api_key=credential,
+        key_source=source,
         system=None if system is None else str(system),
         temperature=validate_temperature(temperature),
         max_tokens=validate_max_tokens(max_tokens),
@@ -735,6 +762,7 @@ def _session_from_saved(
         messages=data.get("messages") or [],
         usage=Usage.from_dict(data.get("usage")),
     )
+    session.target_alias = alias
     print(
         style.dim(
             f"resumed {name} · {provider.name}/{model} · "

@@ -68,6 +68,21 @@ class AssembleTests(unittest.TestCase):
                 ]
             )
 
+    def test_argument_and_call_caps_trip_while_fragments_arrive(self):
+        with self.assertRaises(UsageError) as caught:
+            assemble_tool_calls(
+                [
+                    ToolCallDelta(0, "call", "read_attached_file", "a" * 8000),
+                    ToolCallDelta(0, "", "", "b" * 200),
+                ]
+            )
+        self.assertIn("8192", str(caught.exception))
+        self.assertIn("streaming", str(caught.exception))
+        many = [ToolCallDelta(index, f"id-{index}", "read_attached_file", "{}") for index in range(9)]
+        with self.assertRaises(UsageError) as caught:
+            assemble_tool_calls(many)
+        self.assertIn("8", str(caught.exception))
+
     def test_bad_json_and_unknown_fields(self):
         with self.assertRaises(UsageError):
             parse_path_argument("{")

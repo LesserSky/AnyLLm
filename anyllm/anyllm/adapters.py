@@ -13,7 +13,9 @@ from urllib.parse import quote
 
 from .catalog import ANTHROPIC, GEMINI, OPENAI, Provider
 from .errors import APIError, AuthError, ProviderError
-from .transport import iter_sse, join_url, open_stream, request_json
+from .transport import bound_read_timeout, iter_sse, join_url, open_stream, request_json
+
+READ_SLICE_SECONDS = 5.0
 
 
 @dataclass
@@ -307,6 +309,25 @@ def _content_text(value) -> str:
     return ""
 
 
+def _guarded_sse(response, *, deadline, cancel_event):
+    """SSE iterator that wakes on a short read timeout when a deadline is set."""
+
+    import time
+
+    active = deadline is not None or cancel_event is not None
+    if active:
+        bound_read_timeout(response, READ_SLICE_SECONDS)
+
+    def keep_reading() -> bool:
+        if cancel_event is not None and cancel_event.is_set():
+            return False
+        if deadline is not None and time.perf_counter() >= deadline:
+            return False
+        return True
+
+    yield from iter_sse(response, keep_reading=keep_reading if active else None)
+
+
 def _check_base_url(base_url: str, provider: Provider) -> str:
     if not base_url:
         raise APIError(
@@ -329,6 +350,8 @@ def stream_chat(
     timeout: float = 120.0,
     include_usage: bool = True,
     tools: list | None = None,
+    deadline: float | None = None,
+    cancel_event=None,
 ):
     """Yield response chunks for one completion request.
 
@@ -354,6 +377,8 @@ def stream_chat(
             timeout=timeout,
             include_usage=include_usage,
             tools=tools,
+            deadline=deadline,
+            cancel_event=cancel_event,
         )
     elif provider.kind == ANTHROPIC:
         yield from _anthropic_stream(
@@ -366,6 +391,8 @@ def stream_chat(
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            deadline=deadline,
+            cancel_event=cancel_event,
         )
     elif provider.kind == GEMINI:
         yield from _gemini_stream(
@@ -378,6 +405,8 @@ def stream_chat(
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            deadline=deadline,
+            cancel_event=cancel_event,
         )
     else:
         raise APIError(
@@ -399,6 +428,8 @@ def _openai_stream(
     timeout: float,
     include_usage: bool,
     tools: list | None = None,
+    deadline: float | None = None,
+    cancel_event=None,
 ):
     url = join_url(base_url, "chat/completions")
     if tools:
@@ -439,7 +470,7 @@ def _openai_stream(
             raise
 
     try:
-        for data in iter_sse(response):
+        for data in _guarded_sse(response, deadline=deadline, cancel_event=cancel_event):
             try:
                 event = json.loads(data)
             except json.JSONDecodeError:
@@ -506,6 +537,8 @@ def _anthropic_stream(
     temperature: float | None,
     max_tokens: int | None,
     timeout: float,
+    deadline: float | None = None,
+    cancel_event=None,
 ):
     if not key:
         raise AuthError(
@@ -530,7 +563,7 @@ def _anthropic_stream(
 
     response = open_stream(url, headers, payload, timeout=timeout)
     try:
-        for data in iter_sse(response):
+        for data in _guarded_sse(response, deadline=deadline, cancel_event=cancel_event):
             try:
                 event = json.loads(data)
             except json.JSONDecodeError:
@@ -593,6 +626,8 @@ def _gemini_stream(
     temperature: float | None,
     max_tokens: int | None,
     timeout: float,
+    deadline: float | None = None,
+    cancel_event=None,
 ):
     if not key:
         raise AuthError(
@@ -621,7 +656,7 @@ def _gemini_stream(
 
     response = open_stream(url, headers, payload, timeout=timeout)
     try:
-        for data in iter_sse(response):
+        for data in _guarded_sse(response, deadline=deadline, cancel_event=cancel_event):
             try:
                 event = json.loads(data)
             except json.JSONDecodeError:

@@ -54,7 +54,9 @@ def _blank() -> dict:
     return {"version": 1, "targets": {}}
 
 
-def load_targets() -> dict:
+def load_targets(providers: dict | None = None) -> dict:
+    """Load every target or raise. A bad entry rejects the whole file."""
+
     path = targets_path()
     data = load_feature(path, what="targets")
     targets = data.get("targets", {})
@@ -65,9 +67,23 @@ def load_targets() -> dict:
             "targets.json is malformed.",
             hint=f"'targets' must be an object. Fix or remove {path}.",
         )
+    if providers is None:
+        from .catalog import load_providers
+        from .config import load_config
+
+        providers = load_providers(load_config())
+    # Validate the full map before returning any of it.
+    checked: dict[str, dict] = {}
     for name, spec in targets.items():
-        _validate_stored(name, spec, path)
-    return {"version": 1, "targets": targets}
+        alias = validate_target_alias(str(name), providers)
+        _validate_stored(alias, spec, path)
+        if alias in checked:
+            raise ConfigError(
+                f"Target names {name!r} and {alias!r} normalize to the same alias.",
+                hint=f"Fix or remove {path}.",
+            )
+        checked[alias] = spec
+    return {"version": 1, "targets": checked}
 
 
 def _validate_stored(name: str, spec, path) -> None:
@@ -89,8 +105,10 @@ def save_targets(data: dict) -> None:
     save_feature(targets_path(), {"targets": data.get("targets") or {}})
 
 
-def validate_alias(name: str) -> str:
-    cleaned = (name or "").strip()
+def normalize_alias(name: str) -> str:
+    """Case-fold a label. This does not check provider collisions."""
+
+    cleaned = (name or "").strip().casefold()
     if not _NAME.match(cleaned) or ":" in cleaned:
         raise ConfigError(
             f"Invalid target name {name!r}.",
@@ -99,8 +117,50 @@ def validate_alias(name: str) -> str:
     return cleaned
 
 
+def _env_slug(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").upper()
+
+
+def target_env_var(alias: str) -> str:
+    """Environment variable for a target. Distinct from ANYLLM_<PROVIDER>_API_KEY."""
+
+    return "ANYLLM_TARGET_" + _env_slug(alias) + "_API_KEY"
+
+
+def target_store_name(alias: str) -> str:
+    """Key-store id for a target. Distinct from a provider's saved key."""
+
+    return "target:" + normalize_alias(alias)
+
+
+def alias_collides(alias: str, providers: dict) -> str | None:
+    """Return a short reason when ``alias`` shares a provider name or env slug."""
+
+    folded = alias.casefold()
+    slug = _env_slug(alias)
+    for name in providers:
+        if name.casefold() == folded:
+            return f"provider {name!r}"
+        if _env_slug(name) == slug:
+            return f"the environment name of provider {name!r} (ANYLLM_{_env_slug(name)}_API_KEY)"
+    return None
+
+
+def validate_target_alias(name: str, providers: dict) -> str:
+    cleaned = normalize_alias(name)
+    collision = alias_collides(cleaned, providers)
+    if collision:
+        raise ConfigError(
+            f"Target name {cleaned!r} collides with {collision}.",
+            hint="Choose a name that is not a provider and does not normalize to a provider's "
+            "ANYLLM_<PROVIDER>_API_KEY variable. Target keys use ANYLLM_TARGET_<NAME>_API_KEY "
+            "or `anyllm keys set target:<name>`.",
+        )
+    return cleaned
+
+
 def add_target(name: str, *, provider: str, model: str, base_url: str | None, providers: dict) -> Target:
-    alias = validate_alias(name)
+    alias = validate_target_alias(name, providers)
     if not isinstance(model, str) or not model.strip():
         raise ConfigError("A target needs a model name.", hint="Pass --model NAME.")
     provider_obj = get_provider(provider, providers)
@@ -119,7 +179,7 @@ def add_target(name: str, *, provider: str, model: str, base_url: str | None, pr
 
 
 def remove_target(name: str) -> None:
-    alias = validate_alias(name)
+    alias = normalize_alias(name)
     data = load_targets()
     if alias not in data["targets"]:
         raise ConfigError(
@@ -179,13 +239,20 @@ def _urls_match(left: str, right: str) -> bool:
 
 
 def _alias_credential(alias: str | None, store: KeyStore) -> tuple[str | None, str]:
+    """Read only the target namespace. Never a provider key or ANYLLM_<PROVIDER>_API_KEY."""
+
     if not alias:
         return None, ""
-    env_name = "ANYLLM_" + re.sub(r"[^A-Za-z0-9]+", "_", alias).strip("_").upper() + "_API_KEY"
+    try:
+        alias = normalize_alias(alias)
+    except ConfigError:
+        return None, ""
+    env_name = target_env_var(alias)
     env_value = os.environ.get(env_name)
     if env_value and env_value.strip():
         return env_value.strip(), f"env:{env_name}"
-    saved = store.get(alias)
+    # Provider keys live under the bare provider name. Do not read that slot.
+    saved = store.get(target_store_name(alias))
     if saved:
         return saved, "saved-target"
     return None, ""
@@ -211,7 +278,7 @@ def resolve_credentials(provider, target: Target, store: KeyStore) -> tuple[str 
 
 
 def resolve_named(name: str, providers: dict, store: KeyStore, *, require_credential: bool = True) -> ResolvedTarget:
-    alias = validate_alias(name)
+    alias = validate_target_alias(name, providers)
     spec = list_target_specs().get(alias)
     if spec is None:
         raise ConfigError(
@@ -292,8 +359,9 @@ def _resolve_spec(
         raise ConfigError(
             f"No credential is configured for target {alias or provider.name!r} at {concrete}.",
             hint="This URL is not the provider's default host, so the provider's usual key "
-            "will not be sent there. Save a key for the target name "
-            f"(`anyllm keys set {alias}`) or set ANYLLM_{_env_slug(alias or 'TARGET')}_API_KEY.",
+            "will not be sent there. Save a target key with "
+            f"`anyllm keys set {target_store_name(alias) if alias else 'target:NAME'}` "
+            f"or set {target_env_var(alias or 'NAME')}.",
         )
     return ResolvedTarget(
         target=target,
@@ -305,8 +373,112 @@ def _resolve_spec(
     )
 
 
-def _env_slug(name: str) -> str:
-    return re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").upper()
+def host_uses_provider_key(provider, base_url: str | None) -> bool:
+    """True when this URL is the provider's own configured endpoint.
+
+    An empty provider URL (the built-in ``custom`` provider) means the given
+    URL is that endpoint. Any other non-matching URL must not inherit the
+    provider key.
+    """
+
+    provider_url = getattr(provider, "base_url", "") or ""
+    if not provider_url:
+        return True
+    if not base_url:
+        return True
+    return _urls_match(base_url, provider_url)
+
+
+def resolve_endpoint_key(
+    provider,
+    base_url: str | None,
+    *,
+    target_alias: str | None,
+    store: KeyStore,
+    providers: dict,
+) -> tuple[str | None, str]:
+    """Pick the key for one host. This is the only host-aware lookup.
+
+    A target alias uses the target key namespace. A non-default host without
+    a target alias gets no provider key. Callers that send a request, list
+    models, restore a session, or re-bind after ``/provider`` should use this
+    instead of ``resolve_key``.
+    """
+
+    alias = (target_alias or "").strip() or None
+    if alias:
+        resolved = resolve_named(alias, providers, store, require_credential=False)
+        if base_url and not _urls_match(base_url, resolved.target.base_url):
+            return None, "withheld"
+        return resolved.credential, resolved.credential_source
+    if host_uses_provider_key(provider, base_url):
+        resolution = resolve_key(provider, store)
+        return resolution.value, resolution.source
+    return None, "withheld"
+
+
+def missing_endpoint_key(provider, base_url: str | None, target_alias: str | None) -> ConfigError:
+    if target_alias:
+        return ConfigError(
+            f"No target key for {target_alias!r} at {base_url}.",
+            hint="The provider key is not used for this host. "
+            f"Set {target_env_var(target_alias)} or "
+            f"`anyllm keys set {target_store_name(target_alias)}`.",
+        )
+    if not host_uses_provider_key(provider, base_url):
+        return ConfigError(
+            f"Refusing to send the {provider.name} key to {base_url}.",
+            hint="That URL is not the provider's default host. "
+            "Save a target for it and set ANYLLM_TARGET_<NAME>_API_KEY, "
+            "or use the provider's normal endpoint.",
+        )
+    return ConfigError(
+        f"No API key found for {provider.name}.",
+        hint=f"Run `anyllm keys set {provider.name}`, or set its environment variable.",
+    )
+
+
+def saved_target_alias(data: dict) -> str | None:
+    """Read a persisted target name. Reject anything that is not a string."""
+
+    if "target" not in data:
+        return None
+    raw = data.get("target")
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not raw.strip():
+        raise ConfigError(
+            "Saved session has an invalid target name.",
+            hint="The target field must be a string alias, or be omitted. It must not contain a key.",
+        )
+    return raw.strip()
+
+
+def rebind_session_credentials(session, providers: dict, store: KeyStore) -> None:
+    """Refresh ``session.api_key`` from the target or host rule. Raises when required and missing."""
+
+    alias = getattr(session, "target_alias", None)
+    credential, source = resolve_endpoint_key(
+        session.provider,
+        session.base_url,
+        target_alias=alias,
+        store=store,
+        providers=providers,
+    )
+    if credential:
+        session.api_key = credential
+        session.key_source = source
+        return
+    # An in-memory key is kept only for the provider's own endpoint. A
+    # non-default host must not continue to use a provider key that was cached earlier.
+    if host_uses_provider_key(session.provider, session.base_url) and session.api_key and not alias:
+        if not session.key_source:
+            session.key_source = "session"
+        return
+    session.api_key = None
+    session.key_source = source or "withheld"
+    if session.provider.key_required:
+        raise missing_endpoint_key(session.provider, session.base_url, alias)
 
 
 def conflicting_target_flags(args) -> None:

@@ -18,12 +18,14 @@ from anyllm.catalog import OPENAI, Provider, BUILTINS
 from anyllm.errors import ConfigError, UsageError
 from anyllm.keystore import KeyStore
 from anyllm.targets import (
+    Target,
     add_target,
     conflicting_target_flags,
     list_target_specs,
     load_targets,
     plain_http_warning,
     remove_target,
+    resolve_credentials,
     resolve_member_spec,
     resolve_named,
     split_provider_model,
@@ -137,7 +139,7 @@ class TargetTests(unittest.TestCase):
 
     def test_alias_key_is_sent_to_a_non_default_host(self):
         home = _home(self)
-        with self._env(home, OPENAI_API_KEY="sk-openai-secret", ANYLLM_DEV_API_KEY="dev-secret"):
+        with self._env(home, OPENAI_API_KEY="sk-openai-secret", ANYLLM_TARGET_DEV_API_KEY="dev-secret"):
             add_target(
                 "dev",
                 provider="openai",
@@ -195,6 +197,68 @@ class TargetTests(unittest.TestCase):
         self.assertIsNotNone(warning)
         self.assertIn("not be encrypted", warning)
 
+    def test_alias_cannot_reuse_a_provider_name_or_env_slug(self):
+        home = _home(self)
+        lab = Provider(
+            name="open.scale",
+            label="Open Scale",
+            kind=OPENAI,
+            base_url="https://open.scale.example/v1",
+            env_vars=("OPEN_SCALE_API_KEY",),
+        )
+        providers = dict(BUILTINS)
+        providers["open.scale"] = lab
+        with self._env(home, OPENSCALE_API_KEY="provider-sentinel", ANYLLM_OPENSCALE_API_KEY="also-provider"):
+            store = KeyStore()
+            store.set("openscale", "saved-provider-sentinel")
+            for name in ("openscale", "OpenScale", "OPENSCALE"):
+                with self.subTest(name=name):
+                    with self.assertRaises(ConfigError) as caught:
+                        add_target(
+                            name,
+                            provider="openscale",
+                            model="m",
+                            base_url="http://127.0.0.1:9/v1",
+                            providers=providers,
+                        )
+                    self.assertIn("collides", str(caught.exception).lower())
+            with self.assertRaises(ConfigError):
+                add_target(
+                    "open-scale",
+                    provider="openai",
+                    model="m",
+                    base_url="http://127.0.0.1:9/v1",
+                    providers=providers,
+                )
+            path = targets_path()
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "targets": {
+                            "ok": {
+                                "provider": "openai",
+                                "model": "gpt-4o-mini",
+                                "base_url": None,
+                            },
+                            "openscale": {
+                                "provider": "openscale",
+                                "model": "m",
+                                "base_url": "http://127.0.0.1:9/v1",
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(ConfigError):
+                load_targets(providers)
+            target = Target("openscale", "m", "http://127.0.0.1:9/v1", alias="openscale")
+            credential, _source, _default = resolve_credentials(BUILTINS["openscale"], target, store)
+            self.assertNotEqual(credential, "provider-sentinel")
+            self.assertNotEqual(credential, "also-provider")
+            self.assertNotEqual(credential, "saved-provider-sentinel")
+
     def _env(self, home: Path, **extra):
         cleaned = {
             key: value
@@ -204,6 +268,115 @@ class TargetTests(unittest.TestCase):
         cleaned["ANYLLM_HOME"] = str(home)
         cleaned.update(extra)
         return mock.patch.dict(os.environ, cleaned, clear=True)
+
+
+class EndpointCredentialTests(unittest.TestCase):
+    """Local HTTP only. Sentinel keys must not cross from a provider onto another host."""
+
+    def test_target_identity_survives_models_provider_save_and_resume(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        seen = []
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"
+
+            def log_message(self, *_args):
+                return
+
+            def _record(self):
+                seen.append(self.headers.get("Authorization"))
+
+            def do_GET(self):
+                self._record()
+                body = json.dumps({"data": [{"id": "mock-model"}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length)
+                self._record()
+                payload = (
+                    b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n'
+                    b"data: [DONE]\n\n"
+                )
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.shutdown)
+        self.addCleanup(server.server_close)
+        base = f"http://127.0.0.1:{server.server_address[1]}/v1"
+        home = _home(self)
+        from anyllm.repl import Repl
+        from anyllm.session import Session
+        from anyllm.term import Style
+        from anyllm.config import load_config
+        from anyllm.catalog import load_providers
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "ANYLLM_HOME": str(home),
+                "NO_COLOR": "1",
+                "OPENSCALE_API_KEY": "provider-sentinel",
+                "ANYLLM_TARGET_LAB_API_KEY": "target-sentinel",
+            },
+            clear=False,
+        ):
+            add_target(
+                "lab",
+                provider="openscale",
+                model="mock-model",
+                base_url=base,
+                providers=BUILTINS,
+            )
+            config = load_config()
+            providers = load_providers(config)
+            store = KeyStore()
+            session = Session(BUILTINS["openscale"], "placeholder", api_key="provider-sentinel")
+            repl = Repl(session, Style(False), providers, store, config)
+            from anyllm.targets import repl_target
+
+            repl_target(repl, "lab")
+            self.assertEqual(repl.session.base_url, base)
+            self.assertEqual(repl.session.api_key, "target-sentinel")
+            repl._cmd_models("")
+            repl._cmd_provider("openscale")
+            self.assertEqual(repl.session.base_url, base)
+            self.assertEqual(repl.session.target_alias, "lab")
+            self.assertEqual(repl.session.api_key, "target-sentinel")
+            repl._send("hi")
+            repl._cmd_save("demo")
+            fresh = Session(BUILTINS["openai"], "gpt-4o-mini", api_key="provider-sentinel")
+            other = Repl(fresh, Style(False), providers, store, config)
+            other._cmd_load("demo")
+            self.assertEqual(other.session.base_url, base)
+            self.assertEqual(other.session.target_alias, "lab")
+            self.assertEqual(other.session.api_key, "target-sentinel")
+            other._cmd_models("")
+            # Old file: custom host, no target identity, provider key must not be sent.
+            raw = json.loads((home / "sessions" / "demo.json").read_text(encoding="utf-8"))
+            raw.pop("target")
+            (home / "sessions" / "old.json").write_text(json.dumps(raw), encoding="utf-8")
+            before = len(seen)
+            with self.assertRaises(ConfigError) as caught:
+                other._cmd_load("old")
+            self.assertIn("Refusing to send", str(caught.exception))
+            self.assertEqual(other.session.api_key, "target-sentinel")
+            self.assertEqual(seen[before:], [])
+        self.assertIn("Bearer target-sentinel", seen)
+        self.assertNotIn("Bearer provider-sentinel", seen)
 
 
 if __name__ == "__main__":

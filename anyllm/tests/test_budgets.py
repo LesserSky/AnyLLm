@@ -150,6 +150,15 @@ class BudgetTests(unittest.TestCase):
             self.assertEqual(loaded.max_requests, 4)
             self.assertEqual(loaded.estimated_usd, Decimal("0.02"))
 
+    def test_usd_gate_does_not_treat_other_currencies_as_dollars(self):
+        calls = [PlannedCall("a", "a", 1_000_000, 1_000_000)]
+        prices = {"a": set_price_memory("a", "0.10", "0.10", "EUR")}
+        result = preflight(calls, prices, Budget(estimated_usd=Decimal("100")))
+        self.assertFalse(result.allowed)
+        self.assertIn("EUR", result.reason)
+        self.assertIn("US dollars", result.reason)
+        self.assertIsNone(result.estimate)
+
     def test_heuristic_is_labeled_and_stable(self):
         self.assertEqual(estimate_tokens(""), 0)
         self.assertEqual(estimate_tokens("abcd"), 1)

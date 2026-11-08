@@ -12,6 +12,7 @@ from .catalog import get_provider
 from .config import ensure_config_dir, history_path, validate_max_tokens, validate_temperature
 from .errors import AnyLLMError, ConfigError
 from .keystore import KeyStore, mask_key, resolve_key
+from .targets import missing_endpoint_key, rebind_session_credentials, resolve_endpoint_key, saved_target_alias
 from .seam import HELP_ROWS, REPL_HANDLERS, install_repl_features
 from .session import (
     Session,
@@ -219,6 +220,7 @@ class Repl:
         return 0
 
     def _send(self, text: str) -> None:
+        rebind_session_credentials(self.session, self.providers, self.store)
         printer = StreamPrinter(
             self.style,
             show_reasoning=self.session.show_reasoning,
@@ -320,16 +322,11 @@ class Repl:
         print(self.style.dim(f"model → {rest} (this conversation only)"))
 
     def _cmd_models(self, rest: str) -> None:
-        key = resolve_key(self.session.provider, self.store)
-        if self.session.provider.key_required and not key.value:
-            raise ConfigError(
-                f"No API key for {self.session.provider.name}.",
-                hint=f"Run `anyllm keys set {self.session.provider.name}`.",
-            )
+        rebind_session_credentials(self.session, self.providers, self.store)
         print(self.style.dim("fetching models…"))
         models = list_models(
             self.session.provider,
-            key=key.value,
+            key=self.session.api_key,
             base_url=self.session.base_url,
             timeout=min(self.session.timeout, 60.0),
         )
@@ -373,16 +370,23 @@ class Repl:
                 hint="Add a named endpoint with `anyllm providers add NAME --base-url URL`, "
                 "or start the chat with --base-url. The current provider was left unchanged.",
             )
-        key = resolve_key(provider, self.store)
-        if provider.key_required and not key.value:
-            raise ConfigError(
-                f"No API key for {provider.name}.",
-                hint=f"Run `anyllm keys set {provider.name}`, then /provider {provider.name} again.",
-            )
         old_model = self.session.model
-        self.session.provider = provider
-        self.session.api_key = key.value
-        self.session.key_source = key.source
+        if switching:
+            key = resolve_key(provider, self.store)
+            if provider.key_required and not key.value:
+                raise ConfigError(
+                    f"No API key for {provider.name}.",
+                    hint=f"Run `anyllm keys set {provider.name}`, then /provider {provider.name} again.",
+                )
+            self.session.provider = provider
+            self.session.api_key = key.value
+            self.session.key_source = key.source
+            self.session.target_alias = None
+        else:
+            # Same provider keeps the current host and target identity.
+            # Re-resolve with that identity so a provider key cannot replace a target key.
+            self.session.provider = provider
+            rebind_session_credentials(self.session, self.providers, self.store)
         if switching:
             # The previous endpoint and model belonged to the previous provider.
             # Keep history, but do not keep a stale model when the new provider
@@ -502,15 +506,25 @@ class Repl:
         print(f"  provider:  {provider.name} ({provider.label})")
         print(f"  model:     {session.model}")
         print(f"  endpoint:  {session.base_url}")
-        key = resolve_key(provider, self.store)
-        if not provider.key_required:
+        credential, source = resolve_endpoint_key(
+            provider,
+            session.base_url,
+            target_alias=getattr(session, "target_alias", None),
+            store=self.store,
+            providers=self.providers,
+        )
+        if not provider.key_required and not credential:
             key_text = "not needed"
-        elif key.stored:
-            key_text = f"saved ({mask_key(key.value or '')})"
-        elif key.env_var:
-            key_text = f"environment ({key.env_var})"
+        elif source == "withheld" or not credential:
+            key_text = "withheld (non-default host)"
+        elif source.startswith("env:"):
+            key_text = f"environment ({source.split(':', 1)[1]})"
+        elif source == "saved-target":
+            key_text = f"target key ({mask_key(credential)})"
+        elif source == "saved":
+            key_text = f"saved ({mask_key(credential)})"
         else:
-            key_text = "missing"
+            key_text = source or "configured"
         print(f"  key:       {key_text}")
         print(f"  system:    {session.system or '(none)'}")
         print(f"  messages:  {len(session.messages)}")
@@ -519,17 +533,27 @@ class Repl:
 
     def _cmd_keys(self, _rest: str) -> None:
         provider = self.session.provider
-        key = resolve_key(provider, self.store)
-        if not provider.key_required:
+        credential, source = resolve_endpoint_key(
+            provider,
+            self.session.base_url,
+            target_alias=getattr(self.session, "target_alias", None),
+            store=self.store,
+            providers=self.providers,
+        )
+        if not provider.key_required and not credential:
             print(self.style.dim(f"{provider.name} does not need an API key"))
             return
-        if key.stored:
-            print(f"{provider.name}: saved key {mask_key(key.value or '')}")
-        elif key.env_var:
-            print(f"{provider.name}: from environment variable {key.env_var}")
+        if source == "withheld" or not credential:
+            print(self.style.yellow(f"{provider.name}: provider key withheld for this host"))
+            alias = getattr(self.session, "target_alias", None)
+            print(self.style.dim("  " + missing_endpoint_key(provider, self.session.base_url, alias).hint))
+            return
+        if source.startswith("env:"):
+            print(f"{provider.name}: from environment variable {source.split(':', 1)[1]}")
+        elif source == "saved-target":
+            print(f"{provider.name}: target key {mask_key(credential)}")
         else:
-            print(self.style.yellow(f"{provider.name}: no key configured"))
-            print(self.style.dim(f"  run: anyllm keys set {provider.name}"))
+            print(f"{provider.name}: {source} {mask_key(credential)}")
 
     def _cmd_save(self, rest: str) -> None:
         if not self.session.messages:
@@ -546,12 +570,6 @@ class Repl:
             )
         data = load_session_data(name)
         provider = get_provider(str(data["provider"]), self.providers)
-        key = resolve_key(provider, self.store)
-        if provider.key_required and not key.value:
-            raise ConfigError(
-                f"No API key for {provider.name}.",
-                hint=f"Run `anyllm keys set {provider.name}`, then /load {name} again.",
-            )
         model = data.get("model") or provider.default_model
         if not isinstance(model, str) or not model.strip():
             raise ConfigError(f"Session {name!r} has no model.")
@@ -559,12 +577,22 @@ class Repl:
         temperature = validate_temperature(data.get("temperature"))
         max_tokens = validate_max_tokens(data.get("max_tokens"))
         base_url = session_base_url(data, provider)
+        alias = saved_target_alias(data)
+        credential, source = resolve_endpoint_key(
+            provider,
+            base_url,
+            target_alias=alias,
+            store=self.store,
+            providers=self.providers,
+        )
+        if provider.key_required and not credential:
+            raise missing_endpoint_key(provider, base_url, alias)
         self.session = Session(
             provider,
             model,
             base_url=base_url,
-            api_key=key.value,
-            key_source=key.source,
+            api_key=credential,
+            key_source=source,
             system=data.get("system"),
             temperature=temperature,
             max_tokens=max_tokens,
@@ -573,6 +601,7 @@ class Repl:
             messages=data.get("messages") or [],
             usage=Usage.from_dict(data.get("usage")),
         )
+        self.session.target_alias = alias
         print(
             self.style.dim(
                 f"loaded {name} · {provider.name}/{model} · {len(self.session.messages)} messages"

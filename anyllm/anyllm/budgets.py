@@ -325,16 +325,22 @@ def preflight(
     currency = next(iter(currencies)) if len(currencies) == 1 else None
 
     if gate is not None:
-        if unknown or total is None:
+        if currency and currency != "USD":
+            reasons.append(
+                f"The budget gate is USD ({gate}), but the saved rates are {currency}. "
+                "Refusing rather than treating those rates as US dollars."
+            )
+            total = None
+        elif unknown or total is None:
             names = ", ".join(unknown) or "one or more targets"
             reasons.append(
-                f"A dollar gate is set ({gate}), but the estimate does not cover {names}. "
+                f"A USD gate is set ({gate}), but the estimate does not cover {names}. "
                 "Refusing rather than treating an unknown price as zero."
             )
         elif total > gate:
             reasons.append(
-                f"Heuristic estimate {_format_money(total, currency)} is above the dollar gate "
-                f"{_format_money(gate, currency or 'USD')}."
+                f"Heuristic estimate {_format_money(total, 'USD')} is above the USD gate "
+                f"{_format_money(gate, 'USD')}."
             )
 
     if total is not None and currency:

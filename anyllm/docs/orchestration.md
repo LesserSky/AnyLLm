@@ -103,10 +103,31 @@ payloads into `Session.messages`.
 | `load_feature` / `save_feature` | Versioned JSON under the config directory (`targets.json`, `prices.json`, `budget.json`, `tools.json`, `capabilities.json`, `team.json`, `team-runs/`). Not conversation transcripts. Version is `1`. |
 | `Target(provider, model, base_url, alias)` | No secrets. Resolve credentials with `targets.resolve_named` or `resolve_member_spec` at send time. |
 
-A target whose URL is not the provider's configured host does not receive that
-provider's usual key. Set `ANYLLM_<ALIAS>_API_KEY` or `anyllm keys set ALIAS`.
-The built-in `custom` provider (empty default URL) still uses the normal custom
-key rules, including `ANYLLM_API_KEY`.
+A target name cannot match a provider name, in any letter case, or normalize
+to that provider's `ANYLLM_<PROVIDER>_API_KEY` name. A hand-edited
+`targets.json` with such a name is rejected as a whole.
+
+Target credentials live in a separate namespace: `ANYLLM_TARGET_<NAME>_API_KEY`
+or `anyllm keys set target:<name>`. They are never read from the provider's
+saved key or `ANYLLM_<PROVIDER>_API_KEY`. A non-default host without a target
+alias, including an old session file that only stored `base_url`, does not
+inherit the builtin provider key. Sessions persist `target` (the alias only,
+never the secret). `/models`, `/provider` on the same provider, `/load`, and
+CLI resume all use `resolve_endpoint_key`.
+
+An explicit `ask --provider NAME --base-url URL` is still that one command's
+chosen endpoint. A saved target or resumed session is not.
+
+Quotation delimiters are a fresh `ANYLLM-QUOTE-...` token per synthesis, grown
+until it does not occur in the quoted text. That avoids a member closing a
+fixed marker. It does not guarantee the model will ignore instructions inside
+the quotations.
+
+The team budget gate is USD. Prices saved in another currency are not compared
+to it and the run is refused. Cancellation stops scheduling and uses short
+socket reads so a deadline can be noticed between chunks. It does not kill the
+provider request, and team worker threads are daemons so Ctrl-C is not stuck
+waiting for them forever.
 
 Team runs record target identity, the snapshot id, outputs, usage, and status.
 They do not record credentials. Attachment bodies are not stored. Path and
