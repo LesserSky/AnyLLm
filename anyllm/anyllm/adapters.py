@@ -7,6 +7,7 @@ Every adapter turns one provider's streaming protocol into the same small
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from urllib.parse import quote
 
@@ -190,6 +191,64 @@ def _error_text(detail) -> str:
     return str(detail)
 
 
+# A 400/422 is retried without stream_options only when the server is rejecting
+# that field. A bare "unknown" or any 400 is not enough: temperature, context
+# length, and model errors must surface as-is.
+_STREAM_OPTION_REJECTION = re.compile(
+    r"unsupported|not[\s_-]*supported|unrecognized|unexpected|"
+    r"unknown[\s_-]*(?:parameter|param|argument|field|property)|"
+    r"unknown_parameter|unsupported_parameter|"
+    r"extra[\s_-]*(?:field|input|propert)|"
+    r"additional[\s_-]*propert|"
+    r"not[\s_-]*(?:permitted|allowed)|"
+    r"invalid[\s_-]*(?:parameter|param|argument|field|request[\s_-]*argument)",
+    re.IGNORECASE,
+)
+
+
+def _compact_alnum(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def _mentions_stream_options(*parts: str) -> bool:
+    for part in parts:
+        if part and "streamoption" in _compact_alnum(part):
+            return True
+    return False
+
+
+def _mentions_include_usage(*parts: str) -> bool:
+    for part in parts:
+        if part and "includeusage" in _compact_alnum(part):
+            return True
+    return False
+
+
+def _stream_options_rejected(exc: APIError) -> bool:
+    """True when a 400/422 says ``stream_options`` itself was rejected.
+
+    The follow-up request omits the field. Other client errors are not
+    replayed, and neither are 5xx responses (the completion may have started).
+    """
+    if getattr(exc, "status", None) not in (400, 422):
+        return False
+    param = str(getattr(exc, "param", "") or "")
+    code = str(getattr(exc, "code", "") or "")
+    message = str(getattr(exc, "message", "") or "")
+    blob = " ".join(part for part in (param, code, message) if part)
+    if not _mentions_stream_options(param, code, message) and not _mentions_include_usage(
+        param, code, message
+    ):
+        return False
+    # The structured parameter name is the server pointing at this field.
+    if _mentions_stream_options(param) or _mentions_stream_options(code):
+        return True
+    compact_message = _compact_alnum(message)
+    if compact_message in {"streamoption", "streamoptions", "includeusage"}:
+        return True
+    return _STREAM_OPTION_REJECTION.search(blob) is not None
+
+
 def _token_field(model: str) -> str:
     if model.lower().startswith(("o1", "o3", "o4", "gpt-5")):
         return "max_completion_tokens"
@@ -309,9 +368,14 @@ def _openai_stream(
     try:
         response = open_stream(url, headers, payload, timeout=timeout)
     except APIError as exc:
-        # A few OpenAI-compatible servers reject stream_options. Retry once
-        # without it rather than failing a request that would otherwise work.
-        if include_usage and "stream_option" in str(exc).lower():
+        # Some OpenAI-compatible servers reject stream_options. Retry once
+        # without it when the 400/422 names that field. Do not loop, and do
+        # not drop the field for an unrelated client or server error.
+        if (
+            include_usage
+            and "stream_options" in payload
+            and _stream_options_rejected(exc)
+        ):
             payload.pop("stream_options", None)
             response = open_stream(url, headers, payload, timeout=timeout)
         else:

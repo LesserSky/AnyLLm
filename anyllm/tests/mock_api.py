@@ -7,6 +7,8 @@ client can be exercised without network access or real API keys.
 from __future__ import annotations
 
 import json
+import socket
+import struct
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
@@ -18,6 +20,12 @@ class MockState:
     def __init__(self) -> None:
         self.requests: list[dict] = []
         self.reject_stream_options = False
+        self.stream_options_status = 400
+        self.stream_options_body: dict | None = None
+        # Queues of (status, body) consumed before a normal success response.
+        self.openai_failures: list[tuple[int, dict]] = []
+        self.get_failures: list[tuple[int, dict]] = []
+        self.reset_midstream = False
 
 
 def _openai_events() -> list:
@@ -138,6 +146,28 @@ def make_server(state: MockState | None = None):
             self.end_headers()
             self.wfile.write(body)
 
+        def _abort_stream(self) -> None:
+            """Send one SSE event, then reset the socket so the client sees a midstream failure."""
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            try:
+                self.wfile.write(
+                    b'data: {"choices":[{"index":0,"delta":{"content":"Hi"}}]}\n\n'
+                )
+                self.wfile.flush()
+            except OSError:
+                return
+            conn = self.connection
+            try:
+                conn.setsockopt(
+                    socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0)
+                )
+                conn.close()
+            except OSError:
+                pass
+
         def _unauthorized(self) -> None:
             self._json({"error": {"message": "Incorrect API key provided"}}, 401)
 
@@ -159,6 +189,9 @@ def make_server(state: MockState | None = None):
         def do_GET(self) -> None:
             path = urlsplit(self.path).path
             state.requests.append({"method": "GET", "path": path, "headers": dict(self.headers)})
+            if state.get_failures:
+                status, body = state.get_failures.pop(0)
+                return self._json(body, status)
             if path == "/openai/v1/models":
                 if self.headers.get("Authorization") != f"Bearer {TEST_KEY}":
                     return self._unauthorized()
@@ -212,11 +245,17 @@ def make_server(state: MockState | None = None):
             if path == "/openai/v1/chat/completions":
                 if self.headers.get("Authorization") != f"Bearer {TEST_KEY}":
                     return self._unauthorized()
+                if state.openai_failures:
+                    status, body = state.openai_failures.pop(0)
+                    return self._json(body, status)
+                if state.reset_midstream:
+                    state.reset_midstream = False
+                    return self._abort_stream()
                 if state.reject_stream_options and "stream_options" in payload:
-                    return self._json(
-                        {"error": {"message": "Unsupported parameter: stream_options"}},
-                        400,
-                    )
+                    body = state.stream_options_body or {
+                        "error": {"message": "Unsupported parameter: stream_options"}
+                    }
+                    return self._json(body, state.stream_options_status)
                 self._sse(_openai_events())
             elif path == "/bad/v1/chat/completions":
                 self._unauthorized()

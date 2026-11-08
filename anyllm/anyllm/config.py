@@ -197,3 +197,49 @@ def parse_config_value(text: str):
         return json.loads(stripped)
     except (ValueError, TypeError):
         return text
+
+
+def _as_float(value, name: str) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        raise ConfigError(
+            f"Invalid {name} value {value!r}.",
+            hint="Use a number, e.g. 0.7",
+        ) from None
+
+
+def _as_int(value, name: str) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise ConfigError(
+            f"Invalid {name} value {value!r}.",
+            hint="Use a whole number, e.g. 1024",
+        ) from None
+
+
+def validate_temperature(value) -> float | None:
+    """Accept a sampling temperature in ``[0, 2]``, or ``None`` for the default."""
+    number = _as_float(value, "temperature")
+    if number is not None and not 0.0 <= number <= 2.0:
+        raise ConfigError(
+            f"temperature must be between 0 and 2 (got {number}).",
+            hint="Most models are happiest between 0 and 1.",
+        )
+    return number
+
+
+def validate_max_tokens(value) -> int | None:
+    """Accept a positive response-token cap, or ``None`` for the provider default."""
+    number = _as_int(value, "max_tokens")
+    if number is not None and number <= 0:
+        raise ConfigError(
+            f"max_tokens must be greater than 0 (got {number}).",
+            hint="Try 1024 or 4096.",
+        )
+    return number

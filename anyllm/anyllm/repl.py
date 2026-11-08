@@ -10,7 +10,7 @@ from datetime import datetime
 from . import __version__
 from .adapters import Usage, list_models
 from .catalog import get_provider
-from .config import ensure_config_dir, history_path
+from .config import ensure_config_dir, history_path, validate_max_tokens, validate_temperature
 from .errors import AnyLLMError, ConfigError
 from .keystore import KeyStore, mask_key, resolve_key
 from .session import (
@@ -21,6 +21,7 @@ from .session import (
     list_sessions,
     load_session_data,
     save_session,
+    session_base_url,
 )
 from .term import (
     format_error,
@@ -408,6 +409,15 @@ class Repl:
             return
 
         provider = get_provider(rest, self.providers)
+        switching = provider.name != self.session.provider.name
+        # A provider with no endpoint (the built-in "custom" provider) cannot
+        # be selected from here. Bail out before the session changes.
+        if not provider.base_url and (switching or not self.session.base_url):
+            raise ConfigError(
+                f"Provider {provider.name!r} has no base URL.",
+                hint="Add a named endpoint with `anyllm providers add NAME --base-url URL`, "
+                "or start the chat with --base-url. The current provider was left unchanged.",
+            )
         key = resolve_key(provider, self.store)
         if provider.key_required and not key.value:
             raise ConfigError(
@@ -416,23 +426,29 @@ class Repl:
             )
         old_model = self.session.model
         self.session.provider = provider
-        self.session.base_url = provider.base_url
         self.session.api_key = key.value
         self.session.key_source = key.source
-        if provider.default_model:
-            self.session.model = provider.default_model
+        if switching:
+            # The previous endpoint and model belonged to the previous provider.
+            # Keep history, but do not keep a stale model when the new provider
+            # has no default of its own.
+            self.session.base_url = provider.base_url
+            self.session.model = provider.default_model or ""
+        shown = self.session.model or "(unset)"
         print(
             self.style.dim(
-                f"provider → {provider.name} · model {self.session.model} (history kept; /clear to reset)"
+                f"provider → {provider.name} · model {shown} (history kept; /clear to reset)"
             )
         )
-        if not provider.default_model:
+        if not self.session.model:
             print(
                 self.style.dim(
                     f"  no default model for {provider.name}; set one with /model NAME"
                 )
             )
-        if self.session.model != old_model:
+            if switching and old_model:
+                print(self.style.dim(f"  cleared the previous model {old_model}"))
+        elif self.session.model != old_model:
             print(self.style.dim(f"  model reset from {old_model} to {self.session.model}"))
 
     def _cmd_system(self, rest: str) -> None:
@@ -576,17 +592,21 @@ class Repl:
                 hint=f"Run `anyllm keys set {provider.name}`, then /load {name} again.",
             )
         model = data.get("model") or provider.default_model
-        if not model:
+        if not isinstance(model, str) or not model.strip():
             raise ConfigError(f"Session {name!r} has no model.")
+        # Validate before replacing the live session so a bad file leaves it.
+        temperature = validate_temperature(data.get("temperature"))
+        max_tokens = validate_max_tokens(data.get("max_tokens"))
+        base_url = session_base_url(data, provider)
         self.session = Session(
             provider,
             model,
-            base_url=provider.base_url,
+            base_url=base_url,
             api_key=key.value,
             key_source=key.source,
             system=data.get("system"),
-            temperature=data.get("temperature"),
-            max_tokens=data.get("max_tokens"),
+            temperature=temperature,
+            max_tokens=max_tokens,
             timeout=self.session.timeout,
             show_reasoning=bool(data.get("show_reasoning")),
             messages=data.get("messages") or [],
