@@ -1,0 +1,53 @@
+# Offline tests only. Action SHAs verified 2026-11-08:
+# actions/checkout v4 -> 11d5960a326750d5838078e36cf38b85af677262
+# actions/setup-python v5 -> a26af69be951a213d495a4c3e4e4022e16d87065
+# No pull_request_target, no secrets, and no execution of workspace projects.
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: tests (${{ matrix.os }}, ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python: "3.10"
+          - os: ubuntu-latest
+            python: "3.13"
+          - os: windows-latest
+            python: "3.13"
+    steps:
+      - name: Check out
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Fetch the read-only orchestration seam
+        run: git fetch --depth=1 origin feat/orchestration:refs/remotes/origin/feat/orchestration
+
+      - name: Compile and test
+        working-directory: anyllm
+        shell: bash
+        env:
+          ANYLLM_HOME: ${{ runner.temp }}/anyllm-home
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python -m compileall -q anyllm tests
+          python -m unittest discover -s tests

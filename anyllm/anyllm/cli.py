@@ -259,6 +259,44 @@ def build_parser() -> argparse.ArgumentParser:
     config_path_parser.add_argument("--no-color", action="store_true")
     config_path_parser.set_defaults(func=cmd_config_path)
 
+    file_cmd = sub.add_parser(
+        "file",
+        help="stage local files; nothing is sent or written",
+        description="Stage UTF-8 files under a workspace root. This command never calls a provider.",
+    )
+    file_cmd.add_argument("--root", default=".", help="workspace root")
+    file_cmd.add_argument(
+        "action",
+        choices=("add", "list", "show", "remove", "clear", "root"),
+    )
+    file_cmd.add_argument("paths", nargs="*", help="files, or the new root for action root")
+    file_cmd.add_argument("--no-color", action="store_true")
+    file_cmd.set_defaults(func=cmd_file)
+
+    edit_cmd = sub.add_parser(
+        "edit",
+        help="preview a proposal file; does not write or call a provider",
+        description="Read a proposal from --proposal-file and print a preview. "
+        "The CLI never writes source files and never contacts a provider.",
+    )
+    edit_cmd.add_argument("--root", default=".")
+    edit_cmd.add_argument("--file", action="append", default=[], metavar="PATH")
+    edit_cmd.add_argument("--format", choices=("diff", "blocks"), default="diff")
+    edit_cmd.add_argument("--proposal-file", required=True, metavar="FILE")
+    edit_cmd.add_argument("instruction", nargs="?", default="preview")
+    edit_cmd.add_argument("--no-color", action="store_true")
+    edit_cmd.set_defaults(func=cmd_edit_proposal)
+
+    undo_cmd = sub.add_parser(
+        "undo",
+        help="list edit backups; the CLI does not restore files",
+        description="Show edit journals. Restoring files is only available from an interactive REPL.",
+    )
+    undo_cmd.add_argument("--root", default=".")
+    undo_cmd.add_argument("action", nargs="?", choices=("list", "last"), default="list")
+    undo_cmd.add_argument("--no-color", action="store_true")
+    undo_cmd.set_defaults(func=cmd_undo_cli)
+
     doctor = sub.add_parser(
         "doctor",
         help="check keys, endpoints, and saved settings",
@@ -1202,6 +1240,50 @@ def cmd_doctor(args, style: Style) -> int:
                 print(style.dim(f"    {exc.hint}"))
     print()
     return 1 if failures else 0
+
+
+def cmd_file(args, style: Style) -> int:
+    """Stage files locally. Never calls a provider and never writes source files."""
+    from .workspace import WorkspaceService
+
+    service = WorkspaceService(args.root, style=style)
+    extra = " ".join(args.paths)
+    rest = args.action if not extra else f"{args.action} {extra}"
+    service.handle("file", rest, interactive=False, emit=print)
+    return 0
+
+
+def cmd_edit_proposal(args, style: Style) -> int:
+    """Preview a proposal the user already has. Does not write or send it."""
+    from pathlib import Path
+
+    from .workspace import WorkspaceService
+
+    proposal_path = Path(args.proposal_file)
+    try:
+        model_text = proposal_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise UsageError(f"Could not read proposal file {proposal_path}.") from exc
+    service = WorkspaceService(args.root, style=style)
+    if args.file:
+        service.handle("file", "add " + " ".join(args.file), interactive=False)
+    service.handle(
+        "edit",
+        f"--format {args.format} {args.instruction}",
+        interactive=False,
+        model_text=model_text,
+        emit=print,
+    )
+    return 0
+
+
+def cmd_undo_cli(args, style: Style) -> int:
+    """List journals. interactive=False so last cannot restore files."""
+    from .workspace import WorkspaceService
+
+    service = WorkspaceService(args.root, style=style)
+    service.handle("undo", args.action, interactive=False, emit=print)
+    return 0
 
 
 if __name__ == "__main__":
