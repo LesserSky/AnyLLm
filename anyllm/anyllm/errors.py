@@ -43,9 +43,18 @@ class NetworkError(AnyLLMError):
 class APIError(AnyLLMError):
     """The provider returned an error response."""
 
-    def __init__(self, message: str, hint: str | None = None, status: int | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        hint: str | None = None,
+        status: int | None = None,
+        param: str | None = None,
+        code: str | None = None,
+    ) -> None:
         super().__init__(message, hint=hint)
         self.status = status
+        self.param = param
+        self.code = code
 
 
 class ProviderError(AnyLLMError):

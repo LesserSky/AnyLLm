@@ -29,6 +29,8 @@ from .config import (
     keys_path,
     load_config,
     parse_config_value,
+    validate_max_tokens,
+    validate_temperature,
 )
 from .errors import AnyLLMError, ConfigError, UsageError
 from .keystore import KeyStore, dpapi_available, mask_key, resolve_key
@@ -38,6 +40,7 @@ from .session import (
     finish_notice,
     latest_session_name,
     load_session_data,
+    session_base_url,
 )
 from .term import Style, color_enabled, setup as term_setup
 
@@ -55,7 +58,8 @@ examples:
 
 Provider keys can also come from the environment. AnyLLM checks
 ANYLLM_<PROVIDER>_API_KEY, then the provider's usual variable (for example
-OPENAI_API_KEY), then ANYLLM_API_KEY, then the saved key.
+OPENAI_API_KEY), then a saved key. ANYLLM_API_KEY is used only for a custom
+OpenAI-compatible endpoint, not for built-in hosts.
 """
 
 
@@ -312,24 +316,6 @@ def _print_error(style: Style, exc: AnyLLMError) -> None:
 # -- shared resolution ------------------------------------------------------
 
 
-def _as_float(value, name: str) -> float | None:
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        raise ConfigError(f"Invalid {name} value {value!r}.", hint="Use a number, e.g. 0.7") from None
-
-
-def _as_int(value, name: str) -> int | None:
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        raise ConfigError(f"Invalid {name} value {value!r}.", hint="Use a whole number, e.g. 1024") from None
-
-
 def _as_bool(value, name: str) -> bool:
     if isinstance(value, bool):
         return value
@@ -344,26 +330,6 @@ def _as_bool(value, name: str) -> bool:
         if lowered in ("false", "off", "no", "0", ""):
             return False
     raise ConfigError(f"Invalid {name} value {value!r}.", hint="Use true or false.")
-
-
-def _temperature(value) -> float | None:
-    number = _as_float(value, "temperature")
-    if number is not None and not 0.0 <= number <= 2.0:
-        raise ConfigError(
-            f"temperature must be between 0 and 2 (got {number}).",
-            hint="Most models are happiest between 0 and 1.",
-        )
-    return number
-
-
-def _max_tokens(value) -> int | None:
-    number = _as_int(value, "max_tokens")
-    if number is not None and number <= 0:
-        raise ConfigError(
-            f"max_tokens must be greater than 0 (got {number}).",
-            hint="Try 1024 or 4096.",
-        )
-    return number
 
 
 def _missing_key(provider: Provider) -> ConfigError:
@@ -467,8 +433,8 @@ def _build_session(
         api_key=key.value,
         key_source=key.source,
         system=None if system is None else str(system),
-        temperature=_temperature(temperature),
-        max_tokens=_max_tokens(max_tokens),
+        temperature=validate_temperature(temperature),
+        max_tokens=validate_max_tokens(max_tokens),
         timeout=max(1.0, float(args.timeout)),
         show_reasoning=bool(
             args.reasoning or _as_bool(config.get("show_reasoning"), "show_reasoning")
@@ -504,12 +470,12 @@ def _session_from_saved(
     session = Session(
         provider,
         str(model),
-        base_url=args.base_url or provider.base_url,
+        base_url=session_base_url(data, provider, getattr(args, "base_url", None)),
         api_key=key.value,
         key_source=key.source,
         system=None if system is None else str(system),
-        temperature=_temperature(temperature),
-        max_tokens=_max_tokens(max_tokens),
+        temperature=validate_temperature(temperature),
+        max_tokens=validate_max_tokens(max_tokens),
         timeout=max(1.0, float(args.timeout)),
         show_reasoning=bool(
             args.reasoning or _as_bool(data.get("show_reasoning"), "show_reasoning")
@@ -896,7 +862,7 @@ def cmd_keys_list(args, style: Style) -> int:
     print(
         style.dim(
             "environment variables take precedence over saved keys; "
-            "ANYLLM_API_KEY is used as a last resort"
+            "ANYLLM_API_KEY is only used for custom OpenAI-compatible endpoints"
         )
     )
     return 0
@@ -1101,9 +1067,9 @@ def cmd_config_set(args, style: Style) -> int:
     elif args.key == "system":
         config.set("system", None if value is None else str(value))
     elif args.key == "temperature":
-        config.set("temperature", _temperature(value))
+        config.set("temperature", validate_temperature(value))
     elif args.key == "max_tokens":
-        config.set("max_tokens", _max_tokens(value))
+        config.set("max_tokens", validate_max_tokens(value))
     elif args.key == "show_reasoning":
         config.set("show_reasoning", _as_bool(value, "show_reasoning"))
     else:

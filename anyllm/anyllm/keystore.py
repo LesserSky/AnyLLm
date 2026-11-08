@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .catalog import BUILTINS, OPENAI
 from .config import keys_path, read_json, write_json
 from .errors import ConfigError
 
@@ -287,12 +288,31 @@ class KeyStore:
         return mask_key(value) if value else None
 
 
+def accepts_generic_api_key(provider) -> bool:
+    """Whether the generic ``ANYLLM_API_KEY`` may be sent to ``provider``.
+
+    That variable is for an OpenAI-compatible endpoint the user stood up
+    themselves (the built-in ``custom`` provider, or one added with
+    ``providers add``). Built-in hosts have their own variables. Using the
+    generic key for those would send it to a service it does not name.
+    A provider that lists ``ANYLLM_API_KEY`` in its own env vars still honors
+    that explicit setting; this only gates the implicit fallback.
+    """
+    if getattr(provider, "kind", None) != OPENAI:
+        return False
+    name = getattr(provider, "name", "")
+    if name == "custom":
+        return True
+    return name not in BUILTINS
+
+
 def resolve_key(provider, store: KeyStore | None = None) -> KeyResolution:
     """Find a key for ``provider``, preferring environment variables."""
     store = store or KeyStore()
     candidates: list[str] = [f"ANYLLM_{_env_slug(provider.name)}_API_KEY"]
     candidates.extend(provider.env_vars)
-    candidates.append("ANYLLM_API_KEY")
+    if accepts_generic_api_key(provider):
+        candidates.append("ANYLLM_API_KEY")
     seen: set[str] = set()
     for variable in candidates:
         if not variable or variable in seen:
