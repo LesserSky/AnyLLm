@@ -1117,6 +1117,23 @@ def _key_status(provider: Provider, store: KeyStore) -> str:
     return "missing"
 
 
+def _target_store_slot(name: str, providers: dict[str, Provider]) -> str | None:
+    """Return the target key id, or None when ``name`` is a provider.
+
+    ``target:`` is validated and rejected before any write when the alias
+    collides with a provider. The slot itself cannot be a provider name,
+    because provider names cannot contain a colon.
+    """
+
+    text = (name or "").strip()
+    if not text.casefold().startswith("target:"):
+        return None
+    from .targets import target_store_name, validate_target_alias
+
+    alias = validate_target_alias(text.split(":", 1)[1], providers)
+    return target_store_name(alias)
+
+
 def cmd_keys_set(args, style: Style) -> int:
     config = load_config()
     providers = load_providers(config)
@@ -1128,34 +1145,48 @@ def cmd_keys_set(args, style: Style) -> int:
             hint="For example: anyllm keys set openai. Available: "
             + ", ".join(sorted(providers)),
         )
-    provider = get_provider(str(name), providers)
+    slot = _target_store_slot(str(name), providers)
+    provider = None if slot else get_provider(str(name), providers)
+    label = slot or provider.name
     if args.stdin:
         key = sys.stdin.readline().strip()
     else:
         try:
-            key = getpass.getpass(f"API key for {provider.name}: ").strip()
+            key = getpass.getpass(f"API key for {label}: ").strip()
         except EOFError:
             raise UsageError("No key entered; nothing was saved.") from None
     if not key:
         raise UsageError("No key entered; nothing was saved.")
 
-    scheme = store.set(provider.name, key)
+    scheme = store.set(label, key)
     if scheme == "dpapi":
         detail = "encrypted with Windows DPAPI"
     elif os.name == "nt":
         detail = "stored as plain text (DPAPI was unavailable)"
     else:
         detail = "stored in a file with permissions 600"
-    print(f"saved {provider.name} key → {keys_path()} ({detail})")
+    print(f"saved {label} key → {keys_path()} ({detail})")
 
-    resolution = resolve_key(provider, store)
-    if resolution.env_var:
-        print(
-            style.yellow(
-                f"note: {resolution.env_var} is set and takes precedence over the saved key"
+    if provider is not None:
+        resolution = resolve_key(provider, store)
+        if resolution.env_var:
+            print(
+                style.yellow(
+                    f"note: {resolution.env_var} is set and takes precedence over the saved key"
+                )
             )
-        )
-    print(style.dim("check it with: anyllm doctor --test"))
+        print(style.dim("check it with: anyllm doctor --test"))
+    else:
+        from .targets import target_env_var
+
+        variable = target_env_var(label.split(":", 1)[1])
+        if os.environ.get(variable):
+            print(
+                style.yellow(
+                    f"note: {variable} is set and takes precedence over the saved target key"
+                )
+            )
+        print(style.dim("this key is used only for a saved target with that name"))
     return 0
 
 
@@ -1184,6 +1215,19 @@ def cmd_keys_list(args, style: Style) -> int:
         else:
             env_text = "-"
         rows.append((name, saved, env_text))
+    for slot, info in sorted(infos.items()):
+        if not str(slot).startswith("target:"):
+            continue
+        try:
+            masked = mask_key(store.get(slot) or "")
+            saved = f"{masked} [{info.get('scheme', '?')}]"
+        except AnyLLMError:
+            saved = "(unreadable)"
+        from .targets import target_env_var
+
+        variable = target_env_var(str(slot).split(":", 1)[1])
+        env_text = variable if os.environ.get(variable) else "-"
+        rows.append((slot, saved, env_text))
 
     name_width = max([len("PROVIDER")] + [len(row[0]) for row in rows])
     saved_width = max([len("SAVED")] + [len(row[1]) for row in rows])
@@ -1214,20 +1258,34 @@ def cmd_keys_remove(args, style: Style) -> int:
     name = args.provider or config.get("provider")
     if not name:
         raise UsageError("Choose a provider to remove.", hint="anyllm keys remove openai")
-    provider = get_provider(str(name), providers)
-    removed = store.remove(provider.name)
+    slot = _target_store_slot(str(name), providers)
+    provider = None if slot else get_provider(str(name), providers)
+    label = slot or provider.name
+    removed = store.remove(label)
     if removed:
-        print(f"removed the saved {provider.name} key")
+        print(f"removed the saved {label} key")
     else:
-        print(f"no saved key for {provider.name}")
-    resolution = resolve_key(provider, store)
-    if resolution.env_var:
-        print(
-            style.yellow(
-                f"note: {resolution.env_var} is still set in the environment "
-                "and will keep being used"
+        print(f"no saved key for {label}")
+    if provider is not None:
+        resolution = resolve_key(provider, store)
+        if resolution.env_var:
+            print(
+                style.yellow(
+                    f"note: {resolution.env_var} is still set in the environment "
+                    "and will keep being used"
+                )
             )
-        )
+    else:
+        from .targets import target_env_var
+
+        variable = target_env_var(label.split(":", 1)[1])
+        if os.environ.get(variable):
+            print(
+                style.yellow(
+                    f"note: {variable} is still set in the environment "
+                    "and will keep being used"
+                )
+            )
     return 0
 
 

@@ -352,10 +352,16 @@ def _resolve_spec(
     credential, source, host_is_default = resolve_credentials(provider, target, store)
     if require_credential and provider.key_required and not credential:
         if host_is_default or not (provider.base_url or ""):
-            raise ConfigError(
-                f"No API key found for {provider.name}.",
-                hint=f"Run `anyllm keys set {alias or provider.name}`, or set the provider's environment variable.",
-            )
+            if alias:
+                hint = (
+                    f"Set {target_env_var(alias)} or `anyllm keys set {target_store_name(alias)}`. "
+                    f"The {provider.name} key is also accepted on that provider's own endpoint."
+                )
+            else:
+                hint = (
+                    f"Run `anyllm keys set {provider.name}`, or set the provider's environment variable."
+                )
+            raise ConfigError(f"No API key found for {provider.name}.", hint=hint)
         raise ConfigError(
             f"No credential is configured for target {alias or provider.name!r} at {concrete}.",
             hint="This URL is not the provider's default host, so the provider's usual key "

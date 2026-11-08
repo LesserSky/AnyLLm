@@ -108,12 +108,14 @@ to that provider's `ANYLLM_<PROVIDER>_API_KEY` name. A hand-edited
 `targets.json` with such a name is rejected as a whole.
 
 Target credentials live in a separate namespace: `ANYLLM_TARGET_<NAME>_API_KEY`
-or `anyllm keys set target:<name>`. They are never read from the provider's
-saved key or `ANYLLM_<PROVIDER>_API_KEY`. A non-default host without a target
-alias, including an old session file that only stored `base_url`, does not
-inherit the builtin provider key. Sessions persist `target` (the alias only,
-never the secret). `/models`, `/provider` on the same provider, `/load`, and
-CLI resume all use `resolve_endpoint_key`.
+or `anyllm keys set target:<name>`. That command writes `target:<name>` and
+rejects a colliding alias before it touches the key file, so it cannot
+overwrite `keys set <provider>`. Target keys are never read from the
+provider's saved key or `ANYLLM_<PROVIDER>_API_KEY`. A non-default host
+without a target alias, including an old session file that only stored
+`base_url`, does not inherit the builtin provider key. Sessions persist
+`target` (the alias only, never the secret). `/models`, `/provider` on the
+same provider, `/load`, and CLI resume all use `resolve_endpoint_key`.
 
 An explicit `ask --provider NAME --base-url URL` is still that one command's
 chosen endpoint. A saved target or resumed session is not.

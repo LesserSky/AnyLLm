@@ -378,6 +378,69 @@ class EndpointCredentialTests(unittest.TestCase):
         self.assertIn("Bearer target-sentinel", seen)
         self.assertNotIn("Bearer provider-sentinel", seen)
 
+    def test_keys_set_writes_the_target_slot_and_refuses_a_provider_alias(self):
+        import io
+        from anyllm.cli import cmd_keys_remove, cmd_keys_set
+        from anyllm.term import Style
+
+        home = _home(self)
+        with mock.patch.dict(os.environ, {"ANYLLM_HOME": str(home), "NO_COLOR": "1"}, clear=False):
+            from anyllm.config import load_config
+
+            config = load_config()
+            config.set(
+                "custom_providers",
+                {
+                    "open.scale": {
+                        "label": "Open Scale",
+                        "kind": "openai",
+                        "base_url": "https://open.scale.example/v1",
+                        "env": ["OPEN_SCALE_API_KEY"],
+                    }
+                },
+            )
+            config.save()
+            store = KeyStore()
+            store.set("openscale", "saved-provider-sentinel")
+            store.set("open.scale", "slug-provider-sentinel")
+            style = Style(False)
+            with mock.patch("sys.stdin", io.StringIO("target-secret\n")):
+                with mock.patch("sys.stdout", io.StringIO()):
+                    cmd_keys_set(SimpleNamespace(provider="target:Lab", stdin=True), style)
+            self.assertEqual(store.get("target:lab"), "target-secret")
+            self.assertEqual(store.get("openscale"), "saved-provider-sentinel")
+            self.assertIsNone(store.get("lab"))
+            for blocked in ("target:openscale", "target:OpenScale", "target:open-scale"):
+                with self.subTest(blocked=blocked):
+                    with mock.patch("sys.stdin", io.StringIO("should-not-save\n")):
+                        with self.assertRaises(ConfigError):
+                            cmd_keys_set(SimpleNamespace(provider=blocked, stdin=True), style)
+            self.assertEqual(store.get("openscale"), "saved-provider-sentinel")
+            self.assertEqual(store.get("open.scale"), "slug-provider-sentinel")
+            self.assertIsNone(store.get("target:openscale"))
+            self.assertIsNone(store.get("target:open-scale"))
+            add_target(
+                "lab",
+                provider="openscale",
+                model="m",
+                base_url="http://127.0.0.1:9/v1",
+                providers=BUILTINS,
+            )
+            resolved = resolve_named("lab", BUILTINS, store)
+            credential, source, host_default = (
+                resolved.credential,
+                resolved.credential_source,
+                resolved.host_is_default,
+            )
+            self.assertEqual(credential, "target-secret")
+            self.assertEqual(source, "saved-target")
+            self.assertFalse(host_default)
+            self.assertNotEqual(credential, "saved-provider-sentinel")
+            with mock.patch("sys.stdout", io.StringIO()):
+                cmd_keys_remove(SimpleNamespace(provider="target:lab"), style)
+            self.assertIsNone(store.get("target:lab"))
+            self.assertEqual(store.get("openscale"), "saved-provider-sentinel")
+
 
 if __name__ == "__main__":
     unittest.main()
