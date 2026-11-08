@@ -39,6 +39,9 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
+      - name: Fetch the read-only orchestration seam
+        run: git fetch --depth=1 origin feat/orchestration:refs/remotes/origin/feat/orchestration
+
       - name: Compile and test
         working-directory: anyllm
         shell: bash

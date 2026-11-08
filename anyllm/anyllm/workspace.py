@@ -38,6 +38,11 @@ DEFAULT_MAX_FILES = 20
 
 _CREDENTIAL_NAMES = {
     ".env",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    ".pgpass",
+    ".git-credentials",
     "keys.json",
     "credentials.json",
     "credentials.yml",
@@ -145,7 +150,8 @@ class Workspace:
             flag = ""
             if item.secret_flags:
                 flag = "  warning: " + ", ".join(item.secret_flags)
-            messages.append(f"staged {item.relative} ({item.size} bytes){flag}")
+            shown = escape_terminal_text(item.relative)
+            messages.append(f"staged {shown} ({item.size} bytes){flag}")
         self.attachments = staged
         self.approval = None
         messages.append(
@@ -177,7 +183,8 @@ class Workspace:
             extra = ""
             if item.secret_flags:
                 extra = "  warning: " + ", ".join(item.secret_flags)
-            lines.append(f"  {item.relative}  {item.size} bytes  {item.sha256[:12]}{extra}")
+            shown = escape_terminal_text(item.relative)
+            lines.append(f"  {shown}  {item.size} bytes  {item.sha256[:12]}{extra}")
         lines.append(f"{len(self.attachments)} files, {total} bytes")
         lines.append("Automatic secret detection is incomplete.")
         return lines
@@ -188,7 +195,7 @@ class Workspace:
         if item is None:
             raise UsageError(f"{relative} is not attached.", hint="Stage it with /file add.")
         lines = [
-            f"{item.relative}  {item.size} bytes  newline={item.newline}",
+            f"{escape_terminal_text(item.relative)}  {item.size} bytes  newline={item.newline}",
         ]
         if item.secret_flags:
             lines.append("warning: " + ", ".join(item.secret_flags))
@@ -202,10 +209,8 @@ class Workspace:
         if not items:
             raise UsageError("No files are attached.", hint="Stage files with /file add first.")
         total = sum(item.size for item in items)
-        lines = [
-            "These attached files would be sent as untrusted data.",
-            "Destination: " + ", ".join(destinations),
-        ]
+        lines = ["These attached files would be sent as untrusted data."]
+        lines.extend(describe_destination(destinations[0]))
         for item in items:
             extra = ""
             if item.secret_flags:
@@ -301,13 +306,17 @@ def normalize_relative(raw: str) -> str:
     return "/".join(parts)
 
 
-def credential_filename(name: str) -> bool:
-    lower = name.lower()
-    if lower in _CREDENTIAL_NAMES:
+def credential_filename(name: str, relative: str | None = None) -> bool:
+    """Block well-known credential filenames. This list is not exhaustive."""
+    rel = (relative or name).replace("\\", "/").lower()
+    base = rel.rsplit("/", 1)[-1]
+    if base in _CREDENTIAL_NAMES or name.lower() in _CREDENTIAL_NAMES:
         return True
-    if lower.startswith(".env.") or lower.endswith(".env"):
+    if base.startswith(".env.") or base.endswith(".env"):
         return True
-    return lower.endswith(_CREDENTIAL_SUFFIXES)
+    if base.endswith(_CREDENTIAL_SUFFIXES):
+        return True
+    return rel.endswith("/.aws/credentials") or rel == ".aws/credentials"
 
 
 def escape_terminal_text(text: str) -> str:
@@ -333,7 +342,7 @@ def escape_terminal_text(text: str) -> str:
 
 def read_attachment(root: Path, relative: str, limits: Limits) -> Attachment:
     name = relative.rsplit("/", 1)[-1]
-    if credential_filename(name):
+    if credential_filename(name, relative):
         raise UsageError(
             f"Refusing {relative}: the name looks like a credential file.",
             hint="Attach a source file. This name is blocked. Automatic detection is incomplete.",
@@ -439,13 +448,30 @@ def secret_flags(text: str) -> tuple[str, ...]:
     return tuple(found)
 
 
+def describe_destination(destination: str) -> list[str]:
+    """Render a provider name, or provider, model, and endpoint on separate lines."""
+    parts = destination.split("\n")
+    if len(parts) == 1:
+        return [f"Destination: {escape_terminal_text(parts[0])}"]
+    provider = parts[0]
+    model = parts[1] if len(parts) > 1 else ""
+    endpoint = parts[2] if len(parts) > 2 else ""
+    return [
+        f"Provider: {escape_terminal_text(provider)}",
+        f"Model: {escape_terminal_text(model)}",
+        f"Endpoint: {escape_terminal_text(endpoint)}",
+    ]
+
+
+def destination_key(provider: str, model: str = "", base_url: str = "") -> str:
+    """Identity used for consent. Any change invalidates an earlier approval."""
+    return "\n".join((provider.strip(), model.strip(), base_url.strip()))
+
+
 def _destinations(destination: str) -> tuple[str, ...]:
-    name = destination.strip()
-    if not name:
+    if not str(destination).strip():
         raise UsageError("A destination provider is required before sending files.")
-    if any(char.isspace() for char in name) or "/" in name or "\\" in name:
-        raise UsageError(f"Destination {destination!r} is not a single provider name.")
-    return (name,)
+    return (str(destination),)
 
 
 def _reject_root_syntax(raw: str) -> None:
@@ -481,14 +507,16 @@ def _reject_relative_syntax(text: str) -> None:
 def _open_nofollow(path: Path) -> int:
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     directory = getattr(os, "O_DIRECTORY", 0)
+    binary = getattr(os, "O_BINARY", 0)
     try:
-        dir_fd = os.open(path.parent, os.O_RDONLY | directory)
+        dir_fd = os.open(path.parent, os.O_RDONLY | directory | binary)
     except (OSError, NotImplementedError, AttributeError):
         dir_fd = None
     try:
+        flags = os.O_RDONLY | nofollow | binary
         if dir_fd is None:
-            return os.open(path, os.O_RDONLY | nofollow)
-        return os.open(path.name, os.O_RDONLY | nofollow, dir_fd=dir_fd)
+            return os.open(path, flags)
+        return os.open(path.name, flags, dir_fd=dir_fd)
     except OSError as exc:
         raise UsageError(f"Could not read {path.name} without following a link.") from exc
     finally:
@@ -514,6 +542,7 @@ class WorkspaceService:
         destination: str = "",
         style=None,
         seam=None,
+        destination_resolver=None,
     ) -> None:
         self.workspace = Workspace(root, limits or Limits())
         self.home = home
@@ -521,7 +550,14 @@ class WorkspaceService:
         self.destination = destination
         self.style = style
         self.seam = seam
+        self.destination_resolver = destination_resolver
         self.pending: Proposal | None = None
+        self._emit = None
+
+    def current_destination(self) -> str:
+        if self.destination_resolver is not None:
+            return str(self.destination_resolver())
+        return self.destination
 
     def handle(
         self,
@@ -531,19 +567,40 @@ class WorkspaceService:
         interactive: bool = False,
         confirm=None,
         model_text: str | None = None,
+        emit=None,
     ) -> list[str]:
-        name = command.strip().lower()
-        if name == "file":
-            return self._file(rest)
-        if name == "edit":
-            return self._edit(rest, interactive=interactive, confirm=confirm, model_text=model_text)
-        if name == "undo":
-            return self._undo(rest, interactive=interactive, confirm=confirm)
-        raise UsageError(f"Unknown workspace command {command!r}.")
+        previous = self._emit
+        self._emit = emit
+        try:
+            name = command.strip().lower()
+            if name == "file":
+                return self._file(rest)
+            if name == "edit":
+                return self._edit(rest, interactive=interactive, confirm=confirm, model_text=model_text)
+            if name == "undo":
+                return self._undo(rest, interactive=interactive, confirm=confirm)
+            raise UsageError(f"Unknown workspace command {command!r}.")
+        finally:
+            self._emit = previous
+
+    def _out(self, lines: list[str]) -> list[str]:
+        """Show lines immediately, before any later confirmation callback."""
+        for line in lines:
+            if self._emit is not None:
+                self._emit(line)
+            else:
+                print(line, flush=True)
+        return list(lines)
+
+    def _ask(self, confirm, prompt: str, preamble: list[str]) -> tuple[list[str], str]:
+        shown = self._out(preamble)
+        self._out([prompt])
+        answer = "" if confirm is None else confirm(prompt)
+        return shown + [prompt + answer], answer
 
     def recovery_lines(self) -> list[str]:
         home = self._home()
-        found = unfinished_journals(home)
+        found = unfinished_journals(home, self.workspace.root)
         if not found:
             return []
         lines = [
@@ -568,31 +625,31 @@ class WorkspaceService:
                 raise UsageError("Usage: /file root PATH")
             self.pending = None
             self._drop_published()
-            return self.workspace.set_root(args[0])
+            return self._out(self.workspace.set_root(args[0]))
         if action == "add":
             self.pending = None
             self._drop_published()
-            return self.workspace.add(args)
+            return self._out(self.workspace.add(args))
         if action == "list":
             if args:
                 raise UsageError("Usage: /file list")
-            return self.workspace.list_lines()
+            return self._out(self.workspace.list_lines())
         if action == "show":
             if len(args) != 1:
                 raise UsageError("Usage: /file show PATH")
-            return self.workspace.show_lines(args[0])
+            return self._out(self.workspace.show_lines(args[0]))
         if action == "remove":
             if len(args) != 1:
                 raise UsageError("Usage: /file remove PATH")
             self.pending = None
             self._drop_published()
-            return self.workspace.remove(args[0])
+            return self._out(self.workspace.remove(args[0]))
         if action == "clear":
             if args:
                 raise UsageError("Usage: /file clear")
             self.pending = None
             self._drop_published()
-            return self.workspace.clear()
+            return self._out(self.workspace.clear())
         raise UsageError(
             f"Unknown /file action {action!r}.",
             hint="Use root, add, list, show, remove, or clear.",
@@ -618,19 +675,22 @@ class WorkspaceService:
             model_text = self._generate(fmt, instruction, interactive=interactive, confirm=confirm)
         proposal = parse_proposal(model_text, self.workspace.attachments, fmt)
         self.pending = proposal
-        lines = preview_lines(proposal, style=self.style)
-        lines.append(f"Proposal {proposal.request_id} touches {len(proposal.files)} file(s).")
+        lines = self._out(preview_lines(proposal, style=self.style))
+        lines.extend(self._out([f"Proposal {proposal.request_id} touches {len(proposal.files)} file(s)."]))
         if not interactive:
-            lines.append("Not applied. Noninteractive mode does not write source files.")
+            lines.extend(self._out(["Not applied. Noninteractive mode does not write source files."]))
             return lines
         count = len(proposal.files)
         prompt = f"Apply these changes to {count} file{'s' if count != 1 else ''}? [y/N] "
-        answer = "" if confirm is None else confirm(prompt)
-        lines.append(prompt + answer)
+        asked, answer = self._ask(confirm, prompt, [])
+        lines.extend(asked)
         if not confirmed(answer):
-            lines.append("Not applied. Source files were not changed.")
+            lines.extend(self._out(["Not applied. Source files were not changed."]))
             return lines
-        lines.extend(self._apply_pending())
+        if self.current_destination() != getattr(self, "_approved_destination", self.current_destination()):
+            self._drop_published()
+            raise UsageError("Destination changed before apply. Source files were not changed.")
+        lines.extend(self._out(self._apply_pending()))
         return lines
 
     def _generate(self, fmt: str, instruction: str, *, interactive: bool, confirm) -> str:
@@ -644,21 +704,32 @@ class WorkspaceService:
                 "No proposal runner is connected.",
                 hint="Nothing was sent and no source file was written.",
             )
-        if not self.destination:
+        destination = self.current_destination()
+        if not destination.strip():
             raise UsageError("Set a destination provider before /edit can send files.")
-        lines = self.workspace.approval_lines(self.destination)
-        prompt = "Approve sending these files to " + self.destination + "? [y/N] "
-        answer = "" if confirm is None else confirm(prompt)
+        prompt = "Approve sending these files? [y/N] "
+        _shown, answer = self._ask(confirm, prompt, self.workspace.approval_lines(destination))
         if not confirmed(answer):
             raise UsageError("Not approved. Nothing was sent.")
-        self.workspace.grant(self.destination, answer)
-        files = self.workspace.fresh_files(self.destination)
+        if self.current_destination() != destination:
+            self._drop_published()
+            raise UsageError(
+                "Destination changed before sending. Nothing was sent.",
+                hint="Approve the new provider, model, and endpoint.",
+            )
+        self.workspace.grant(destination, answer)
+        self._approved_destination = destination
+        files = self.workspace.fresh_files(destination)
+        if self.current_destination() != destination:
+            self.workspace.approval = None
+            self._drop_published()
+            raise UsageError("Destination changed before sending. Nothing was sent.")
         request = EditRequest(
             instruction=instruction,
             format=fmt,
-            destination=self.destination,
+            destination=destination,
             files=tuple(files),
-            prompt=build_prompt(instruction, fmt, files, self.destination),
+            prompt=build_prompt(instruction, fmt, files, destination.replace("\n", " ")),
         )
         if self.seam is not None:
             text = self.seam.request(files, request)
@@ -675,8 +746,8 @@ class WorkspaceService:
     def _edit_show(self) -> list[str]:
         if self.pending is None:
             raise UsageError("No edit proposal is pending.")
-        lines = preview_lines(self.pending, style=self.style)
-        lines.append("Show does not write source files.")
+        lines = self._out(preview_lines(self.pending, style=self.style))
+        lines.extend(self._out(["Show does not write source files."]))
         return lines
 
     def _edit_discard(self) -> list[str]:
@@ -688,18 +759,18 @@ class WorkspaceService:
     def _edit_apply(self, *, interactive: bool, confirm) -> list[str]:
         if self.pending is None:
             raise UsageError("No edit proposal is pending.")
-        lines = preview_lines(self.pending, style=self.style)
+        preview = preview_lines(self.pending, style=self.style)
         if not interactive:
-            lines.append("Not applied. Noninteractive mode does not write source files.")
+            lines = self._out(preview)
+            lines.extend(self._out(["Not applied. Noninteractive mode does not write source files."]))
             return lines
         count = len(self.pending.files)
         prompt = f"Apply these changes to {count} file{'s' if count != 1 else ''}? [y/N] "
-        answer = "" if confirm is None else confirm(prompt)
-        lines.append(prompt + answer)
+        lines, answer = self._ask(confirm, prompt, preview)
         if not confirmed(answer):
-            lines.append("Not applied. Source files were not changed.")
+            lines.extend(self._out(["Not applied. Source files were not changed."]))
             return lines
-        lines.extend(self._apply_pending())
+        lines.extend(self._out(self._apply_pending()))
         return lines
 
     def _apply_pending(self) -> list[str]:
@@ -715,21 +786,23 @@ class WorkspaceService:
         action = (rest.strip().split() or ["list"])[0].lower()
         home = self._home()
         if action == "list":
-            rows = list_journals(home)
+            rows = list_journals(home, self.workspace.root)
             if not rows:
-                return ["No edit journals."]
+                return self._out(["No edit journals."])
             lines = ["Edit journals (backups stay on disk; they are not deleted):"]
             for item in rows:
-                paths = ", ".join(entry["path"] for entry in item["files"])
-                lines.append(f"  {item['id']}  {item['state']}  {paths}")
+                paths = ", ".join(escape_terminal_text(entry["path"]) for entry in item["files"])
+                lines.append(
+                    f"  {escape_terminal_text(str(item['id']))}  {item['state']}  {paths}"
+                )
             lines.append(f"Backup directory: {edits_dir(home)}")
-            return lines
+            return self._out(lines)
         if action == "recover":
             return self._recover(interactive=interactive, confirm=confirm)
         if action != "last":
             raise UsageError("Usage: /undo list | /undo last")
         if not interactive:
-            found = list_journals(home)
+            found = list_journals(home, self.workspace.root)
             applied = [item for item in found if item["state"] == "applied"]
             if not applied:
                 raise UsageError("No applied edit to undo.")
@@ -737,42 +810,41 @@ class WorkspaceService:
                 f"Undo would restore {len(applied[-1]['files'])} file(s) from {applied[-1]['id']}."
             ]
             lines.append("Not restored. Noninteractive mode does not write source files.")
-            return lines
-        latest = [item for item in list_journals(home) if item["state"] == "applied"]
+            return self._out(lines)
+        latest = [item for item in list_journals(home, self.workspace.root) if item["state"] == "applied"]
         if not latest:
             raise UsageError("No applied edit to undo.")
         count = len(latest[-1]["files"])
         prompt = f"Restore {count} file{'s' if count != 1 else ''} from backup? [y/N] "
-        answer = "" if confirm is None else confirm(prompt)
+        lines, answer = self._ask(confirm, prompt, [])
         if not confirmed(answer):
-            return [prompt + (answer or ""), "Not restored. Source files were not changed."]
+            lines.extend(self._out(["Not restored. Source files were not changed."]))
+            return lines
         result = undo_last_applied(self.workspace.root, home)
         self.workspace.approval = None
-        return [prompt + answer, *result.messages]
+        lines.extend(self._out(result.messages))
+        return lines
 
     def _recover(self, *, interactive: bool, confirm) -> list[str]:
         """Reviewed recovery. Never called implicitly, and never without y."""
         home = self._home()
-        found = unfinished_journals(home)
+        found = unfinished_journals(home, self.workspace.root)
         if not found:
-            return ["No unfinished edit journals."]
+            return self._out(["No unfinished edit journals."])
         lines = ["Unfinished journals:"]
         for item in found:
-            paths = ", ".join(entry["path"] for entry in item["files"])
-            lines.append(f"  {item['id']} state={item['state']} {paths}")
+            paths = ", ".join(escape_terminal_text(entry["path"]) for entry in item["files"])
+            lines.append(f"  {escape_terminal_text(str(item['id']))} state={item['state']} {paths}")
         if not interactive:
             lines.append("Not recovered. Noninteractive mode does not write source files.")
-            return lines
+            return self._out(lines)
         prompt = f"Recover {len(found)} unfinished journal(s)? [y/N] "
-        answer = "" if confirm is None else confirm(prompt)
-        lines.append(prompt + (answer or ""))
+        lines, answer = self._ask(confirm, prompt, lines)
         if not confirmed(answer):
-            lines.append("Not recovered. Source files were not changed.")
+            lines.extend(self._out(["Not recovered. Source files were not changed."]))
             return lines
         for item in found:
-            lines.extend(
-                recover_journal(self.workspace.root, home, item["id"]).messages
-            )
+            lines.extend(self._out(recover_journal(self.workspace.root, home, item["id"]).messages))
         return lines
 
     def _home(self) -> Path:

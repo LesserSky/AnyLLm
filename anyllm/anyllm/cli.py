@@ -1283,8 +1283,7 @@ def cmd_file(args, style: Style) -> int:
     service = WorkspaceService(args.root, style=style)
     extra = " ".join(args.paths)
     rest = args.action if not extra else f"{args.action} {extra}"
-    for line in service.handle("file", rest, interactive=False):
-        print(line)
+    service.handle("file", rest, interactive=False, emit=print)
     return 0
 
 
@@ -1302,14 +1301,13 @@ def cmd_edit_proposal(args, style: Style) -> int:
     service = WorkspaceService(args.root, style=style)
     if args.file:
         service.handle("file", "add " + " ".join(args.file), interactive=False)
-    lines = service.handle(
+    service.handle(
         "edit",
         f"--format {args.format} {args.instruction}",
         interactive=False,
         model_text=model_text,
+        emit=print,
     )
-    for line in lines:
-        print(line)
     return 0
 
 
@@ -1318,8 +1316,7 @@ def cmd_undo_cli(args, style: Style) -> int:
     from .workspace import WorkspaceService
 
     service = WorkspaceService(args.root, style=style)
-    for line in service.handle("undo", args.action, interactive=False):
-        print(line)
+    service.handle("undo", args.action, interactive=False, emit=print)
     return 0
 
 

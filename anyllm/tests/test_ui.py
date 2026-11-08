@@ -62,8 +62,11 @@ class ColorEnabledTests(unittest.TestCase):
     def test_tty_is_colored_and_pipe_is_plain(self):
         with mock.patch.dict(os.environ, {"TERM": "xterm-256color"}, clear=False):
             _without_color_env()
-            self.assertTrue(color_enabled(stream=Tty()))
-            self.assertFalse(color_enabled(stream=Pipe()))
+            # GitHub's Windows runner has no VT console. This test is about
+            # isatty, not that probe; test_old_windows_console covers VT.
+            with mock.patch("anyllm.term._windows_vt_supported", return_value=True):
+                self.assertTrue(color_enabled(stream=Tty()))
+                self.assertFalse(color_enabled(stream=Pipe()))
 
     def test_no_color_flag_and_env_win_over_force_and_tty(self):
         tty = Tty()
@@ -83,7 +86,8 @@ class ColorEnabledTests(unittest.TestCase):
             clear=False,
         ):
             os.environ.pop("FORCE_COLOR", None)
-            self.assertTrue(color_enabled(stream=Tty()))
+            with mock.patch("anyllm.term._windows_vt_supported", return_value=True):
+                self.assertTrue(color_enabled(stream=Tty()))
 
     def test_force_color_overrides_pipe_and_dumb_terminal(self):
         with mock.patch.dict(os.environ, {"FORCE_COLOR": "1", "TERM": "dumb"}, clear=False):

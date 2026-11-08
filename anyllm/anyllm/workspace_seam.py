@@ -121,6 +121,7 @@ class SeamPort:
     system: str | None = None
     event_queue: object | None = None
     cancel_event: object | None = None
+    destination_now: object | None = None
     published: list = field(default_factory=list)
     last_snapshot: object | None = None
     last_result: object | None = None
@@ -147,6 +148,12 @@ class SeamPort:
             raise UsageError(
                 "Refusing a snapshot that carries a credential.",
                 hint="Nothing was written.",
+            )
+        if self.destination_now is not None and self.destination_now() != edit_request.destination:
+            self.revoke_published()
+            raise UsageError(
+                "Destination changed before the request was sent. Nothing further was sent.",
+                hint="Approve the new provider, model, and endpoint.",
             )
         provider = self.provider_obj() if callable(self.provider_obj) else self.provider_obj
         target = self.target() if callable(self.target) else self.target
@@ -226,37 +233,46 @@ def bind_service(service, repl) -> bool:
     module = load_orchestration_seam()
     if module is None or repl is None or not hasattr(repl, "session"):
         return False
-    session = repl.session
+    from .workspace import destination_key
+
+    def session():
+        return repl.session
 
     def history():
-        return list(session.messages)
+        return list(session().messages)
 
     def system():
-        return session.system
+        return session().system
 
     def provider():
-        return session.provider
+        return session().provider
 
     def target():
+        current = session()
         return TargetView(
-            provider=session.provider.name,
-            model=session.model,
-            base_url=session.base_url or "",
+            provider=current.provider.name,
+            model=current.model,
+            base_url=current.base_url or "",
             alias=None,
         )
 
     def credential():
-        return session.api_key
+        return session().api_key
 
     def options():
+        current = session()
         return module.RunOptions(
-            timeout=getattr(session, "timeout", 120.0),
-            max_tokens=session.max_tokens,
-            temperature=session.temperature,
+            timeout=getattr(current, "timeout", 120.0),
+            max_tokens=current.max_tokens,
+            temperature=current.temperature,
             show_reasoning=False,
         )
 
-    service.destination = service.destination or session.provider.name
+    def destination():
+        current = session()
+        return destination_key(current.provider.name, current.model, current.base_url or "")
+
+    service.destination_resolver = destination
     service.seam = SeamPort(
         store=module.attachment_store(),
         make_snapshot=module.make_snapshot,
@@ -269,6 +285,7 @@ def bind_service(service, repl) -> bool:
         history=history,
         system=system,
         event_queue=queue.Queue(),
+        destination_now=destination,
     )
     service.style = getattr(repl, "style", service.style)
     return True
@@ -301,10 +318,12 @@ def dispatch_repl(repl, command: str, rest: str) -> None:
     def confirm(prompt: str) -> str:
         return input(prompt)
 
-    lines = service.handle(command, rest, interactive=interactive, confirm=confirm)
+    def emit(line: str) -> None:
+        present_lines([line], repl)
+
+    service.handle(command, rest, interactive=interactive, confirm=confirm, emit=emit)
     if service.seam is not None:
         drain_events(service.seam.event_queue, getattr(repl, "presentation", None))
-    present_lines(lines, repl)
 
 
 def _destination(repl) -> str:

@@ -16,6 +16,7 @@ import json
 import os
 import stat
 import tempfile
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -128,28 +129,45 @@ def parse_proposal(text: str, attachments: dict, fmt: str) -> Proposal:
 
 def preview_lines(proposal: Proposal, style=None) -> list[str]:
     """Trusted preview. Model-authored diff text is not printed as the diff."""
-    import difflib
-
     from .workspace import escape_terminal_text
 
     lines: list[str] = []
     for relative in sorted(proposal.files):
         plan = proposal.files[relative]
-        diff = "".join(
-            difflib.unified_diff(
-                _display_lines(plan.logical_before),
-                _display_lines(plan.logical_after),
-                fromfile=escape_terminal_text(relative),
-                tofile=escape_terminal_text(relative),
-            )
-        )
-        shown = escape_terminal_text(diff)
+        shown = escape_terminal_text(_trusted_diff(plan))
         if style is not None and getattr(style, "enabled", False):
             shown = _color_diff(shown, style)
         lines.append(shown.rstrip("\n"))
     if not lines:
         lines.append("(empty proposal)")
     return lines
+
+
+def _trusted_diff(plan: FilePlan) -> str:
+    """LF unified diff. A missing final newline is an explicit marker line."""
+    import difflib
+
+    before_lines, before_ends = _split_logical(plan.logical_before)
+    after_lines, after_ends = _split_logical(plan.logical_after)
+    diff = "".join(
+        difflib.unified_diff(
+            [line + "\n" for line in before_lines],
+            [line + "\n" for line in after_lines],
+            fromfile=plan.relative,
+            tofile=plan.relative,
+        )
+    )
+    if not after_ends and (after_lines or before_lines):
+        if diff and not diff.endswith("\n"):
+            diff += "\n"
+        diff += "\\ No newline at end of file\n"
+    if not before_ends and before_lines and after_lines != before_lines:
+        # Keep the marker visible even when difflib only saw newline-terminated copies.
+        if "\\ No newline at end of file\n" not in diff:
+            if diff and not diff.endswith("\n"):
+                diff += "\n"
+            diff += "\\ No newline at end of file\n"
+    return diff
 
 
 def edits_dir(home: Path) -> Path:
@@ -200,7 +218,7 @@ def apply_proposal(proposal: Proposal, root: Path, home: Path, *, faults: Faults
         if faults.fail_backup == index:
             _write_journal(
                 run_dir,
-                _journal_payload(run_id, proposal, "failed", entries, note="backup-failed"),
+                _journal_payload(run_id, proposal, "failed", entries, root=root, note="backup-failed"),
             )
             raise UsageError(
                 "Backup failed. No source file was modified.",
@@ -208,8 +226,18 @@ def apply_proposal(proposal: Proposal, root: Path, home: Path, *, faults: Faults
             )
         backup_rel = _safe_journal_name(plan.relative, "before")
         staged_rel = _safe_journal_name(plan.relative, "after")
-        _write_private(run_dir / backup_rel, plan.before_bytes)
-        _write_private(run_dir / staged_rel, plan.after_bytes)
+        try:
+            _write_private(run_dir / backup_rel, plan.before_bytes)
+            _write_private(run_dir / staged_rel, plan.after_bytes)
+        except OSError as exc:
+            _write_journal(
+                run_dir,
+                _journal_payload(run_id, proposal, "failed", entries, root=root, note="backup-failed"),
+            )
+            raise UsageError(
+                "Backup failed or could not be kept private. No source file was modified.",
+                hint=str(exc),
+            ) from exc
         entries.append(
             {
                 "path": plan.relative,
@@ -222,7 +250,7 @@ def apply_proposal(proposal: Proposal, root: Path, home: Path, *, faults: Faults
         )
         # Silence unused import if Limits stays available for oversized re-read.
         _ = (path, Limits)
-    _write_journal(run_dir, _journal_payload(run_id, proposal, "prepared", entries))
+    _write_journal(run_dir, _journal_payload(run_id, proposal, "prepared", entries, root=root))
     replaced: list[dict] = []
     try:
         for index, entry in enumerate(entries):
@@ -232,12 +260,16 @@ def apply_proposal(proposal: Proposal, root: Path, home: Path, *, faults: Faults
             replaced.append(entry)
             _write_journal(
                 run_dir,
-                _journal_payload(run_id, proposal, "applying", entries, replaced=len(replaced)),
+                _journal_payload(
+                    run_id, proposal, "applying", entries, root=root, replaced=len(replaced)
+                ),
             )
-    except OSError as exc:
+    except (OSError, UsageError) as exc:
         return _rollback(root, run_dir, run_id, proposal, entries, replaced, exc, faults)
-    _write_journal(run_dir, _journal_payload(run_id, proposal, "applied", entries))
-    names = ", ".join(entry["path"] for entry in entries)
+    _write_journal(run_dir, _journal_payload(run_id, proposal, "applied", entries, root=root))
+    from .workspace import escape_terminal_text
+
+    names = ", ".join(escape_terminal_text(entry["path"]) for entry in entries)
     return ApplyResult(
         run_id=run_id,
         state="applied",
@@ -249,50 +281,62 @@ def apply_proposal(proposal: Proposal, root: Path, home: Path, *, faults: Faults
     )
 
 
+def workspace_identity(root: Path) -> tuple[str, str]:
+    real = str(Path(root).resolve())
+    return real, hashlib.sha256(real.encode("utf-8")).hexdigest()
+
+
 def undo_last_applied(root: Path, home: Path, *, faults: Faults | None = None) -> ApplyResult:
-    applied = [item for item in list_journals(home) if item["state"] == "applied"]
+    applied = [
+        item
+        for item in list_journals(home, root)
+        if item["state"] == "applied"
+    ]
     if not applied:
-        raise UsageError("No applied edit to undo.")
+        raise UsageError("No applied edit to undo for this workspace.")
     return _restore_run(root, home, applied[-1]["id"], faults=faults, require_after=True)
 
 
-def list_journals(home: Path) -> list[dict]:
-    root = Path(home) / "edits"
-    if not root.exists():
+def list_journals(home: Path, root: Path | None = None) -> list[dict]:
+    base = Path(home) / "edits"
+    if not base.exists():
         return []
     found = []
-    for child in sorted(root.iterdir()):
+    wanted = workspace_identity(root)[1] if root is not None else None
+    for child in base.iterdir():
         journal = child / "journal.json"
         if child.is_symlink() or not journal.is_file() or journal.is_symlink():
             continue
         try:
-            data = json.loads(journal.read_text(encoding="utf-8"))
+            data = json.loads(_read_bytes(journal).decode("utf-8"))
         except (OSError, UnicodeError, json.JSONDecodeError):
             continue
         if not isinstance(data, dict) or data.get("id") != child.name:
             continue
+        if wanted is not None and data.get("workspace_id") != wanted:
+            continue
         found.append(data)
+    found.sort(key=lambda item: (str(item.get("created") or ""), int(item.get("sequence") or 0)))
     return found
 
 
-def unfinished_journals(home: Path) -> list[dict]:
+def unfinished_journals(home: Path, root: Path | None = None) -> list[dict]:
     return [
         item
-        for item in list_journals(home)
-        if item.get("state") in {"prepared", "applying", "partial"}
+        for item in list_journals(home, root)
+        if item.get("state") in {"prepared", "applying", "partial", "restoring"}
     ]
 
 
 def recover_journal(root: Path, home: Path, run_id: str, *, faults: Faults | None = None) -> ApplyResult:
-    """Reviewed recovery for one unfinished journal.
-
-    A ``prepared`` journal has not replaced source files; confirming it marks
-    the journal aborted and does not write those files. ``applying`` and
-    ``partial`` restore files whose current bytes are the applied version.
-    """
+    """Reviewed recovery. Never claims a file is untouched without hashing it."""
     data = _load_run(home, run_id)
+    _require_same_workspace(data, root)
     state = data.get("state")
-    if state == "prepared":
+    if state not in {"prepared", "applying", "partial", "restoring"}:
+        raise UsageError(f"Journal {run_id} is {state}, not an unfinished edit.")
+    replaced = _entries_matching(root, data["files"], "after_hash")
+    if state == "prepared" and not replaced:
         data["state"] = "aborted"
         data["recovered"] = _now()
         _write_journal(_run_dir(home, run_id), data)
@@ -300,12 +344,14 @@ def recover_journal(root: Path, home: Path, run_id: str, *, faults: Faults | Non
             run_id=run_id,
             state="aborted",
             messages=[
-                f"Journal {run_id} was prepared but source files were not replaced.",
-                "Marked aborted. Source files were left as they are.",
+                f"Journal {run_id} was prepared and the source bytes still match the originals.",
+                "Marked aborted. Source files were not replaced.",
             ],
         )
-    if state not in {"applying", "partial"}:
-        raise UsageError(f"Journal {run_id} is {state}, not an unfinished edit.")
+    if state == "prepared" and replaced:
+        # The replace landed and the process died before the journal said so.
+        data["state"] = "applying"
+        _write_journal(_run_dir(home, run_id), data)
     return _restore_run(root, home, run_id, faults=faults, require_after=False)
 
 
@@ -317,35 +363,41 @@ def _restore_run(
     faults: Faults | None,
     require_after: bool,
 ) -> ApplyResult:
-    from .workspace import confine_existing_file, read_attachment
-
     faults = faults or Faults()
     data = _load_run(home, run_id)
+    _require_same_workspace(data, root)
     run_dir = _run_dir(home, run_id)
     entries = list(data["files"])
+    plan: list[tuple[dict, str]] = []
+    for entry in entries:
+        current = _hash_file(root, entry["path"])
+        if current == entry["before_hash"]:
+            plan.append((entry, "skip"))
+            continue
+        if current != entry["after_hash"]:
+            plan.append((entry, "conflict"))
+            continue
+        _verified_backup(run_dir, entry)
+        plan.append((entry, "restore"))
+    conflicts = [entry["path"] for entry, action in plan if action == "conflict"]
+    if conflicts and not any(action == "restore" for _entry, action in plan):
+        raise UsageError(
+            "Refusing to undo "
+            + ", ".join(conflicts)
+            + ": it no longer matches the applied edit.",
+            hint="The file changed after apply. Nothing was restored.",
+        )
     restored: list[str] = []
+    data["state"] = "restoring"
+    _write_journal(run_dir, data)
     try:
-        for index, entry in enumerate(entries):
-            path = confine_existing_file(root, entry["path"])
-            current = read_attachment(root, entry["path"], _read_limits_from_entry(entry, path))
-            if current.sha256 == entry["before_hash"]:
+        for index, (entry, action) in enumerate(plan):
+            if action != "restore":
                 continue
-            if current.sha256 != entry["after_hash"]:
-                if restored:
-                    data["state"] = "partial"
-                    _write_journal(run_dir, data)
-                raise UsageError(
-                    f"Refusing to undo {entry['path']}: it no longer matches the applied edit.",
-                    hint="The file changed after apply. Nothing further was restored.",
-                )
-            if not restored:
-                data["state"] = "restoring"
-                _write_journal(run_dir, data)
             if faults.fail_restore == index:
                 raise OSError(28, "No space left on device")
-            _install_bytes(root, entry["path"], run_dir / entry["backup"], int(entry["mode"]))
+            _install_verified_backup(root, run_dir, entry)
             restored.append(entry["path"])
-            _ = path
     except OSError as exc:
         data["state"] = "partial"
         data["restore_error"] = os.strerror(exc.errno) if exc.errno else str(exc)
@@ -356,10 +408,20 @@ def _restore_run(
             + ". The journal is marked partial.",
             hint=f"See {run_dir}. Source may be partially restored.",
         ) from exc
+    if conflicts:
+        data["state"] = "partial"
+        data["unrestored"] = conflicts
+        _write_journal(run_dir, data)
+        raise UsageError(
+            "Refusing to overwrite newer work in " + ", ".join(conflicts) + ".",
+            hint="Those files were left as they are. The journal is marked partial.",
+        )
     data["state"] = "undone"
     data["undone"] = _now()
     _write_journal(run_dir, data)
-    shown = ", ".join(restored) if restored else "(already at the backup bytes)"
+    from .workspace import escape_terminal_text
+
+    shown = ", ".join(escape_terminal_text(name) for name in restored) if restored else "(already at the backup bytes)"
     return ApplyResult(
         run_id=run_id,
         state="undone",
@@ -370,22 +432,26 @@ def _restore_run(
 def _rollback(root, run_dir, run_id, proposal, entries, replaced, exc, faults) -> ApplyResult:
     problems: list[str] = []
     for index, entry in enumerate(reversed(replaced)):
+        current = _hash_file(root, entry["path"])
+        if current is None or current != entry["after_hash"]:
+            problems.append(entry["path"])
+            continue
         if faults.fail_restore is not None and index == 0 and faults.fail_restore == 0:
             problems.append(entry["path"])
             continue
         try:
-            _install_bytes(root, entry["path"], run_dir / entry["backup"], int(entry["mode"]))
-        except OSError:
+            _install_verified_backup(root, run_dir, entry)
+        except (OSError, UsageError):
             problems.append(entry["path"])
     if problems:
-        payload = _journal_payload(run_id, proposal, "partial", entries, note="restore-failed")
+        payload = _journal_payload(run_id, proposal, "partial", entries, root=root, note="restore-failed")
         payload["unrestored"] = problems
         _write_journal(run_dir, payload)
         raise UsageError(
             "Replace failed and restore was partial for: " + ", ".join(problems),
-            hint=f"Journal {run_dir} is marked partial. Do not assume the tree is unchanged.",
+            hint=f"Journal {run_dir} is marked partial. Independently changed files were not overwritten.",
         ) from exc
-    _write_journal(run_dir, _journal_payload(run_id, proposal, "failed", entries, note="rolled-back"))
+    _write_journal(run_dir, _journal_payload(run_id, proposal, "failed", entries, root=root, note="rolled-back"))
     raise UsageError(
         "Replace failed. Files that had been replaced were restored from backup.",
         hint=f"No source file was left on the new bytes. Journal: {run_dir}",
@@ -407,10 +473,19 @@ def _replace_file(root: Path, run_dir: Path, entry: dict) -> None:
 
 
 def _install_bytes(root: Path, relative: str, source: Path, mode: int) -> None:
+    payload = _read_confined_store(source)
+    _install_payload(root, relative, payload, mode)
+
+
+def _install_verified_backup(root: Path, run_dir: Path, entry: dict) -> None:
+    payload = _verified_backup(run_dir, entry)
+    _install_payload(root, entry["path"], payload, int(entry["mode"]))
+
+
+def _install_payload(root: Path, relative: str, payload: bytes, mode: int) -> None:
     from .workspace import confine_existing_file
 
     target = confine_existing_file(root, relative)
-    payload = _read_confined_store(source)
     directory = target.parent
     fd, temp_name = tempfile.mkstemp(prefix=".anyllm-", suffix=".tmp", dir=directory)
     temp_path = Path(temp_name)
@@ -420,18 +495,21 @@ def _install_bytes(root: Path, relative: str, source: Path, mode: int) -> None:
     finally:
         os.close(fd)
     try:
-        os.chmod(temp_path, mode)
+        if os.name != "nt":
+            os.chmod(temp_path, mode)
     except OSError as exc:
         temp_path.unlink(missing_ok=True)
         raise UsageError(f"Could not preserve permissions on {relative}.") from exc
     os.replace(temp_path, target)
-    try:
-        os.chmod(target, mode)
-    except OSError:
-        # The bytes are in place. Put the previous mode back if chmod failed
-        # after replace by rewriting from the caller only when mode drifted.
-        current = stat.S_IMODE(target.stat().st_mode)
-        if current != mode:
+    if os.name == "nt":
+        return
+    current = stat.S_IMODE(target.stat().st_mode)
+    if current != stat.S_IMODE(mode):
+        try:
+            os.chmod(target, mode)
+        except OSError as exc:
+            raise UsageError(f"Could not preserve permissions on {relative}.") from exc
+        if stat.S_IMODE(target.stat().st_mode) != stat.S_IMODE(mode):
             raise UsageError(f"Could not preserve permissions on {relative}.")
 
 
@@ -489,27 +567,33 @@ def _parse_hunk(lines: list[str], index: int) -> tuple[dict, int]:
     if old_len == 0 and old_start < 0:
         raise UsageError("Malformed hunk header.")
     index += 1
-    body: list[tuple[str, str]] = []
-    marker = False
+    body: list[tuple[str, str, bool]] = []
     while index < len(lines):
         line = lines[index]
         if line.startswith("@@ ") or line.startswith("--- "):
             break
         if line == r"\ No newline at end of file":
-            marker = True
+            if not body:
+                raise UsageError("A no-newline marker does not follow a diff line.")
+            kind, text, _marked = body[-1]
+            body[-1] = (kind, text, True)
             index += 1
-            break
+            continue
         if not line or line[0] not in {" ", "+", "-"}:
             raise UsageError("Diff hunk contains a line that is not context, add, or remove.")
-        body.append((line[0], line[1:]))
+        if "\x00" in line:
+            raise UsageError("Diff hunk contains a NUL byte and was rejected.")
+        body.append((line[0], line[1:], False))
         index += 1
-    old_lines = [text for kind, text in body if kind in {" ", "-"}]
-    new_lines = [text for kind, text in body if kind in {" ", "+"}]
+    old_lines = [text for kind, text, _marked in body if kind in {" ", "-"}]
+    new_marked = [(text, marked) for kind, text, marked in body if kind in {" ", "+"}]
+    new_lines = [text for text, _marked in new_marked]
     if len(old_lines) != old_len or len(new_lines) != new_len:
         raise UsageError(
             "Hunk counts do not match the hunk body.",
             hint=f"Header says -{old_len} +{new_len}, body has -{len(old_lines)} +{len(new_lines)}.",
         )
+    no_newline = bool(new_marked and new_marked[-1][1])
     return (
         {
             "old_start": old_start,
@@ -518,7 +602,7 @@ def _parse_hunk(lines: list[str], index: int) -> tuple[dict, int]:
             "new_len": new_len,
             "old_lines": old_lines,
             "new_lines": new_lines,
-            "no_newline": marker,
+            "no_newline": no_newline,
         },
         index,
     )
@@ -613,6 +697,8 @@ def _parse_blocks(body: str, attachments: dict) -> list[FilePlan]:
             raise UsageError("Edit path, search, and replace must be strings.")
         if search == "":
             raise UsageError("An empty search string is ambiguous and was rejected.")
+        if "\x00" in search or "\x00" in replace:
+            raise UsageError("A NUL byte in an edit was rejected. Nothing was written.")
         if "\r" in search or "\r" in replace:
             raise UsageError("Search and replace must use LF newlines, not CR.")
         from .workspace import normalize_relative
@@ -773,13 +859,19 @@ def _color_diff(text: str, style) -> str:
     return "".join(colored)
 
 
-def _journal_payload(run_id, proposal, state, entries, *, note: str = "", replaced: int = 0) -> dict:
+def _journal_payload(run_id, proposal, state, entries, *, root: Path | None = None, note: str = "", replaced: int = 0) -> dict:
+    real, ident = ("", "")
+    if root is not None:
+        real, ident = workspace_identity(root)
     payload = {
         "version": JOURNAL_VERSION,
         "id": run_id,
         "state": state,
         "created": _now(),
+        "sequence": time.time_ns(),
         "request_id": proposal.request_id,
+        "workspace_root": real,
+        "workspace_id": ident,
         "files": entries,
         "replaced": replaced,
     }
@@ -789,29 +881,215 @@ def _journal_payload(run_id, proposal, state, entries, *, note: str = "", replac
 
 
 def _write_journal(run_dir: Path, payload: dict) -> None:
-    _write_private(run_dir / "journal.json", (json.dumps(payload, indent=2) + "\n").encode("utf-8"))
+    raw = (json.dumps(payload, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    _write_private(run_dir / "journal.json", raw)
+    _fsync_dir(run_dir)
 
 
 def _write_private(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     _private_dir(path.parent)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    binary = getattr(os, "O_BINARY", 0)
+    fd, temp_name = tempfile.mkstemp(prefix=".journal-", suffix=".tmp", dir=str(path.parent))
+    temp_path = Path(temp_name)
     try:
         os.write(fd, data)
         os.fsync(fd)
     finally:
         os.close(fd)
+    os.replace(temp_path, path)
     if os.name != "nt":
         os.chmod(path, 0o600)
+    else:
+        _restrict_to_current_user(path)
 
 
 def _private_dir(path: Path) -> None:
+    if os.name != "nt":
+        try:
+            os.chmod(path, 0o700)
+        except OSError:
+            pass
+        return
+    _restrict_to_current_user(path)
+
+
+def _restrict_to_current_user(path: Path) -> None:
+    """Leave only the current user on the DACL. Fail closed if that cannot be done."""
+    import ctypes
+    from ctypes import wintypes
+
+    try:
+        _restrict_to_current_user_win32(path)
+    except OSError:
+        raise
+    except Exception as exc:
+        raise OSError(0, f"Windows ACL setup failed: {exc}") from exc
+
+
+def _restrict_to_current_user_win32(path: Path) -> None:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+
+    class SID_AND_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", wintypes.DWORD)]
+
+    class TOKEN_USER(ctypes.Structure):
+        _fields_ = [("User", SID_AND_ATTRIBUTES)]
+
+    class TRUSTEE_W(ctypes.Structure):
+        _fields_ = [
+            ("pMultipleTrustee", ctypes.c_void_p),
+            ("MultipleTrusteeOperation", wintypes.DWORD),
+            ("TrusteeForm", wintypes.DWORD),
+            ("TrusteeType", wintypes.DWORD),
+            ("ptstrName", ctypes.c_void_p),
+        ]
+
+    class EXPLICIT_ACCESS_W(ctypes.Structure):
+        _fields_ = [
+            ("grfAccessPermissions", wintypes.DWORD),
+            ("grfAccessMode", wintypes.DWORD),
+            ("grfInheritance", wintypes.DWORD),
+            ("Trustee", TRUSTEE_W),
+        ]
+
+    token = wintypes.HANDLE()
+    if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), 0x0008, ctypes.byref(token)):
+        raise OSError(ctypes.get_last_error(), "OpenProcessToken")
+    try:
+        length = wintypes.DWORD()
+        advapi32.GetTokenInformation(token, 1, None, 0, ctypes.byref(length))
+        buffer = ctypes.create_string_buffer(length.value)
+        if not advapi32.GetTokenInformation(token, 1, buffer, length, ctypes.byref(length)):
+            raise OSError(ctypes.get_last_error(), "GetTokenInformation")
+        user = ctypes.cast(buffer, ctypes.POINTER(TOKEN_USER)).contents
+        explicit = EXPLICIT_ACCESS_W()
+        explicit.grfAccessPermissions = 0x1F01FF
+        explicit.grfAccessMode = 1
+        explicit.grfInheritance = 0
+        explicit.Trustee.TrusteeForm = 0
+        explicit.Trustee.TrusteeType = 1
+        explicit.Trustee.ptstrName = user.User.Sid
+        acl = ctypes.c_void_p()
+        status = advapi32.SetEntriesInAclW(1, ctypes.byref(explicit), None, ctypes.byref(acl))
+        if status != 0:
+            raise OSError(status, "SetEntriesInAclW")
+        try:
+            status = advapi32.SetNamedSecurityInfoW(
+                ctypes.create_unicode_buffer(str(path)),
+                1,
+                0x4 | 0x80000000,
+                None,
+                None,
+                acl,
+                None,
+            )
+            if status != 0:
+                raise OSError(status, "SetNamedSecurityInfoW")
+        finally:
+            kernel32.LocalFree(acl)
+    finally:
+        kernel32.CloseHandle(token)
+
+
+def _fsync_dir(path: Path) -> None:
     if os.name == "nt":
         return
     try:
-        os.chmod(path, 0o700)
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
     except OSError:
         pass
+    finally:
+        os.close(fd)
+
+
+def _hash_file(root: Path, relative: str) -> str | None:
+    from .workspace import confine_existing_file
+
+    try:
+        path = confine_existing_file(root, relative)
+    except UsageError:
+        return None
+    try:
+        return hashlib.sha256(_read_bytes(path)).hexdigest()
+    except OSError:
+        return None
+
+
+def _entries_matching(root: Path, entries: list[dict], field_name: str) -> list[str]:
+    matched = []
+    for entry in entries:
+        if _hash_file(root, entry["path"]) == entry.get(field_name):
+            matched.append(entry["path"])
+    return matched
+
+
+def _require_same_workspace(data: dict, root: Path) -> None:
+    ident = data.get("workspace_id")
+    if not ident or ident != workspace_identity(root)[1]:
+        raise UsageError(
+            "This edit journal belongs to a different workspace.",
+            hint="Refusing to restore files into the current root.",
+        )
+
+
+def _verified_backup(run_dir: Path, entry: dict) -> bytes:
+    path = _journal_file(run_dir, str(entry.get("backup") or ""))
+    data = _read_bytes(path)
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != entry.get("before_hash"):
+        raise UsageError(
+            f"Backup for {entry.get('path')} does not match the original hash.",
+            hint="The source file was not changed.",
+        )
+    return data
+
+
+def _journal_file(run_dir: Path, relative_name: str) -> Path:
+    if not relative_name or relative_name.startswith(("/", "\\")) or ".." in Path(relative_name).parts:
+        raise UsageError("Refusing a journal path that escapes the backup directory.")
+    path = (run_dir / relative_name).resolve()
+    base = run_dir.resolve()
+    if path != base and base not in path.parents:
+        raise UsageError("Refusing a journal path that escapes the backup directory.")
+    if path.is_symlink():
+        raise UsageError("Refusing a symlinked backup.")
+    return path
+
+
+def _read_bytes(path: Path) -> bytes:
+    binary = getattr(os, "O_BINARY", 0)
+    fd = os.open(path, os.O_RDONLY | binary)
+    try:
+        chunks = []
+        while True:
+            block = os.read(fd, 1024 * 1024)
+            if not block:
+                break
+            chunks.append(block)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
 
 
 def _read_confined_store(path: Path) -> bytes:

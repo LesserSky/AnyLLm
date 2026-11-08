@@ -60,6 +60,9 @@ class PathSyntaxTests(unittest.TestCase):
             self.assertTrue(credential_filename(name), name)
         self.assertFalse(credential_filename("app.py"))
         self.assertFalse(credential_filename("README.md"))
+        self.assertTrue(credential_filename(".netrc"))
+        self.assertTrue(credential_filename(".npmrc"))
+        self.assertTrue(credential_filename("credentials", ".aws/credentials"))
 
 
 class AttachmentTests(unittest.TestCase):
@@ -186,6 +189,20 @@ class AttachmentTests(unittest.TestCase):
             self.skipTest("symlinks are not available")
         with self.assertRaises(UsageError):
             Workspace(link)
+
+    def test_staged_path_escapes_are_not_raw(self):
+        name = "bad\x1b[2Jname.txt"
+        (self.root / name).write_text("hello\n", encoding="utf-8")
+        lines = "\n".join(self.workspace.add([name]))
+        self.assertNotIn("\x1b", lines)
+        self.assertIn("\\u001b", lines)
+
+    def test_netrc_is_refused_without_quoting_the_secret(self):
+        secret = "SuperSecret123"
+        (self.root / ".netrc").write_text(f"machine example login demo password {secret}\n", encoding="utf-8")
+        with self.assertRaises(UsageError) as caught:
+            self.workspace.add([".netrc"])
+        self.assertNotIn(secret, str(caught.exception))
 
     def test_show_escapes_osc_and_esc(self):
         payload = "hello \x1b]8;;http://evil.example\x07click\x1b]8;;\x07 tail\n"

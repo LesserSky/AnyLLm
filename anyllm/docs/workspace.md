@@ -42,6 +42,17 @@ again.
 
 ## Limits and refusals
 
+Reads and backup writes use binary mode, including on Windows, so CRLF bytes
+are not translated. Journals record the workspace root. Undo and recovery
+only touch that root, and only when the current bytes and the backup hash
+match the journal. A file that changed again is left alone.
+
+On Windows, backup directories and files get a protected DACL for the current
+user. If that cannot be set, apply stops before it changes source files.
+Automatic secret detection is still incomplete. `.netrc`, `.npmrc`, `.pypirc`,
+`.git-credentials`, `.pgpass`, and `.aws/credentials` are refused by name,
+along with `.env` and private-key names.
+
 Defaults, adjustable by constructing `Limits`:
 
 - 256 KiB per file

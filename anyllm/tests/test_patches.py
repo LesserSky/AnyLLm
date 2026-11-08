@@ -9,6 +9,7 @@ import sys
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -401,7 +402,7 @@ class ApplyUndoTests(unittest.TestCase):
         run_id = "preparedcase"
         run_dir = edits_dir(self.home) / run_id
         run_dir.mkdir()
-        payload = _journal_payload(run_id, proposal, "prepared", [])
+        payload = _journal_payload(run_id, proposal, "prepared", [], root=self.root)
         _write_journal(run_dir, payload)
         lines = self.service.handle("undo", "recover", interactive=False)
         self.assertIn("Not recovered", "\n".join(lines))
@@ -430,6 +431,181 @@ class ApplyUndoTests(unittest.TestCase):
         paths = [item.relative for item in self.calls[0].files]
         self.assertEqual(paths, ["src/app.py"])
         self.assertNotIn("hidden-value", self.calls[0].prompt)
+
+
+class ReviewRegressionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.root = new_temp_dir(self)
+        self.home = new_temp_dir(self)
+        (self.root / "a.txt").write_bytes(b"old\n")
+        (self.root / "b.txt").write_bytes(b"old\n")
+        self.service = WorkspaceService(self.root, home=self.home, destination="openai")
+        self.service.handle("file", "add a.txt b.txt")
+
+    def _proposal(self, paths):
+        from anyllm.patches import parse_proposal
+
+        payload = {
+            "edits": [{"path": path, "search": "old", "replace": "new"} for path in paths]
+        }
+        return parse_proposal(__import__("json").dumps(payload), self.service.workspace.attachments, "blocks")
+
+    def test_review_text_is_visible_before_confirmation(self):
+        import io
+        from contextlib import redirect_stdout
+
+        seen = []
+
+        def confirm(prompt):
+            seen.append(prompt)
+            return "y" if prompt.startswith("Approve") else "n"
+
+        self.service.runner = lambda _request: __import__("json").dumps(
+            {"edits": [{"path": "a.txt", "search": "old", "replace": "new"}]}
+        )
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.service.handle("edit", '--format blocks "change"', interactive=True, confirm=confirm)
+        self.assertGreaterEqual(len(seen), 2)
+        before_send = buf.getvalue().split("Approve sending")[0]
+        self.assertIn("a.txt", before_send)
+        self.assertIn("Destination:", before_send)
+        self.assertIn("old", (self.root / "a.txt").read_text(encoding="utf-8"))
+        self.assertIn("-old", buf.getvalue().split("Apply these changes")[0])
+        self.assertEqual((self.root / "a.txt").read_bytes(), b"old\n")
+
+    def test_undo_does_not_cross_workspaces(self):
+        from anyllm.patches import apply_proposal, undo_last_applied
+
+        apply_proposal(self._proposal(["a.txt"]), self.root, self.home)
+        other = self.root.parent / "other-root"
+        other.mkdir()
+        (other / "a.txt").write_bytes(b"new\n")
+        with self.assertRaises(UsageError) as caught:
+            undo_last_applied(other, self.home)
+        self.assertIn("workspace", str(caught.exception).lower())
+        self.assertEqual((other / "a.txt").read_bytes(), b"new\n")
+        self.assertEqual((self.root / "a.txt").read_bytes(), b"new\n")
+
+    def test_undo_last_follows_creation_time_not_uuid_sort(self):
+        from anyllm import patches as patchmod
+
+        class Ident:
+            def __init__(self, value):
+                self.hex = value
+
+        first = self._proposal(["a.txt"])
+        second = self._proposal(["b.txt"])
+        with mock.patch.object(patchmod.uuid, "uuid4", return_value=Ident("f" * 32)):
+            patchmod.apply_proposal(first, self.root, self.home)
+        with mock.patch.object(patchmod.uuid, "uuid4", return_value=Ident("0" * 32)):
+            patchmod.apply_proposal(second, self.root, self.home)
+        result = patchmod.undo_last_applied(self.root, self.home)
+        self.assertEqual(result.run_id, "0" * 32)
+        self.assertEqual((self.root / "a.txt").read_bytes(), b"new\n")
+        self.assertEqual((self.root / "b.txt").read_bytes(), b"old\n")
+
+    def test_stale_later_file_rolls_back_without_touching_it(self):
+        from anyllm import patches as patchmod
+
+        proposal = self._proposal(["a.txt", "b.txt"])
+        original = patchmod._replace_file
+
+        def swap(root, run_dir, entry):
+            if entry["path"] == "b.txt":
+                (root / "b.txt").write_bytes(b"user kept\n")
+            return original(root, run_dir, entry)
+
+        with self.assertRaises(UsageError):
+            with mock.patch.object(patchmod, "_replace_file", swap):
+                patchmod.apply_proposal(proposal, self.root, self.home)
+        self.assertEqual((self.root / "a.txt").read_bytes(), b"old\n")
+        self.assertEqual((self.root / "b.txt").read_bytes(), b"user kept\n")
+
+    def test_rollback_does_not_overwrite_a_newer_edit(self):
+        from anyllm import patches as patchmod
+
+        proposal = self._proposal(["a.txt", "b.txt"])
+        original = patchmod._replace_file
+
+        def crash(root, run_dir, entry):
+            if entry["path"] == "b.txt":
+                (root / "a.txt").write_bytes(b"newer user\n")
+                raise OSError(28, "disk full")
+            return original(root, run_dir, entry)
+
+        with self.assertRaises(UsageError) as caught:
+            with mock.patch.object(patchmod, "_replace_file", crash):
+                patchmod.apply_proposal(proposal, self.root, self.home)
+        self.assertIn("partial", str(caught.exception).lower())
+        self.assertEqual((self.root / "a.txt").read_bytes(), b"newer user\n")
+        self.assertEqual((self.root / "b.txt").read_bytes(), b"old\n")
+
+    def test_undo_rejects_a_backup_that_does_not_match_the_hash(self):
+        from anyllm.patches import apply_proposal, list_journals, undo_last_applied
+
+        result = apply_proposal(self._proposal(["a.txt"]), self.root, self.home)
+        journal = list_journals(self.home, self.root)[-1]
+        backup = self.home / "edits" / result.run_id / journal["files"][0]["backup"]
+        backup.write_bytes(b"corrupted backup\n")
+        with self.assertRaises(UsageError) as caught:
+            undo_last_applied(self.root, self.home)
+        self.assertIn("hash", str(caught.exception).lower())
+        self.assertEqual((self.root / "a.txt").read_bytes(), b"new\n")
+
+    def test_prepared_journal_with_replaced_bytes_is_not_called_untouched(self):
+        from anyllm import patches as patchmod
+
+        proposal = self._proposal(["a.txt"])
+        original = patchmod._write_journal
+
+        def stop(directory, data):
+            if data.get("state") == "applying":
+                raise KeyboardInterrupt("power loss")
+            return original(directory, data)
+
+        with self.assertRaises(KeyboardInterrupt):
+            with mock.patch.object(patchmod, "_write_journal", stop):
+                patchmod.apply_proposal(proposal, self.root, self.home)
+        self.assertEqual((self.root / "a.txt").read_bytes(), b"new\n")
+        found = patchmod.unfinished_journals(self.home, self.root)
+        self.assertTrue(found)
+        recovered = patchmod.recover_journal(self.root, self.home, found[-1]["id"])
+        self.assertNotIn("not replaced", " ".join(recovered.messages).lower())
+        self.assertEqual((self.root / "a.txt").read_bytes(), b"old\n")
+
+    def test_restoring_state_is_recoverable(self):
+        from anyllm.patches import apply_proposal, list_journals, unfinished_journals, _write_journal
+
+        result = apply_proposal(self._proposal(["a.txt"]), self.root, self.home)
+        journal = list_journals(self.home, self.root)[-1]
+        journal["state"] = "restoring"
+        _write_journal(self.home / "edits" / result.run_id, journal)
+        self.assertTrue(unfinished_journals(self.home, self.root))
+
+    def test_nul_in_a_proposal_is_rejected(self):
+        from anyllm.patches import parse_proposal
+
+        payload = __import__("json").dumps(
+            {"edits": [{"path": "a.txt", "search": "old", "replace": "new\x00"}]}
+        )
+        with self.assertRaises(UsageError):
+            parse_proposal(payload, self.service.workspace.attachments, "blocks")
+        self.assertEqual((self.root / "a.txt").read_bytes(), b"old\n")
+
+    def test_standard_two_marker_diff_preserves_missing_newline(self):
+        bare = self.root / "bare.txt"
+        bare.write_bytes(b"beta")
+        self.service.handle("file", "add bare.txt")
+        diff = (
+            "--- a/bare.txt\n+++ b/bare.txt\n@@ -1 +1 @@\n-beta\n"
+            "\\ No newline at end of file\n+BETA\n\\ No newline at end of file\n"
+        )
+        self.service.handle("edit", '--format diff "x"', model_text=diff)
+        shown = "\n".join(self.service.handle("edit", "show"))
+        self.assertIn("\\ No newline at end of file", shown)
+        self.service.handle("edit", "apply", interactive=True, confirm=lambda _prompt: "y")
+        self.assertEqual(bare.read_bytes(), b"BETA")
 
 
 if __name__ == "__main__":

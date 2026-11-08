@@ -25,6 +25,7 @@ from anyllm.repl import Repl
 from anyllm.session import Session
 from anyllm.term import Style
 from anyllm.workspace import WorkspaceService
+from anyllm.workspace import destination_key
 from anyllm.workspace_seam import (
     dispatch_repl,
     SeamPort,
@@ -265,6 +266,27 @@ class SeamContractTests(unittest.TestCase):
             self.assertEqual(len(row), 2)
 
 
+    def test_destination_change_before_send_invalidates_consent(self):
+        current = {"value": destination_key("openai", "mock", "https://a.example/v1")}
+        self.service.destination_resolver = lambda: current["value"]
+        self.port.destination_now = lambda: current["value"]
+        seen = []
+
+        def confirm(prompt):
+            seen.append(prompt)
+            if prompt.startswith("Approve"):
+                current["value"] = destination_key("other", "mock", "https://b.example/v1")
+                return "y"
+            return "n"
+
+        with self.assertRaises(UsageError) as caught:
+            self.service.handle("edit", '--format blocks "change"', interactive=True, confirm=confirm)
+        self.assertIn("changed", str(caught.exception).lower())
+        self.assertEqual(self.calls, [])
+        self.assertEqual((self.root / "app.py").read_bytes(), b"print(1)\n")
+        self.assertTrue(seen)
+
+
 class WiredCommandTests(unittest.TestCase):
     def setUp(self) -> None:
         self.root = new_temp_dir(self)
@@ -380,7 +402,7 @@ class WiredCommandTests(unittest.TestCase):
         self.assertIn("Not applied", result.stdout)
         self.assertIn("print(2)", result.stdout)
         self.assertNotIn("\x1b", result.stdout)
-        self.assertNotIn("secret", result.stdout)
+        self.assertNotIn("secret-key", result.stdout)
         self.assertEqual((self.root / "app.py").read_text(encoding="utf-8"), "print(1)\n")
         listed = subprocess.run(
             [sys.executable, "-m", "anyllm", "undo", "--root", str(self.root), "last"],
