@@ -74,11 +74,22 @@ class Usage:
 
 
 @dataclass
+class ToolCallDelta:
+    """One streamed fragment of a tool call. Fragments share an index."""
+
+    index: int
+    id: str = ""
+    name: str = ""
+    arguments: str = ""
+
+
+@dataclass
 class Chunk:
     text: str = ""
     reasoning: str = ""
     usage: Usage | None = None
     finish_reason: str | None = None
+    tool_call: ToolCallDelta | None = None
 
 
 def _int(value) -> int | None:
@@ -91,6 +102,35 @@ def _int(value) -> int | None:
     if isinstance(value, str) and value.isdigit():
         return int(value)
     return None
+
+
+def _openai_tool_messages(messages, system: str | None) -> list[dict]:
+    """Keep tool-call turns. Used only when the caller opted into tools."""
+
+    conversation: list[dict] = []
+    if system and system.strip():
+        conversation.append({"role": "system", "content": system})
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        content = message.get("content")
+        if role in ("user", "assistant") and isinstance(content, str):
+            item = {"role": role, "content": content}
+            calls = message.get("tool_calls")
+            if isinstance(calls, list) and calls:
+                item["tool_calls"] = calls
+            if content.strip() or item.get("tool_calls"):
+                conversation.append(item)
+        elif role == "tool" and isinstance(content, str):
+            conversation.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": str(message.get("tool_call_id") or ""),
+                    "content": content,
+                }
+            )
+    return conversation
 
 
 def _normalize_messages(messages) -> list[dict]:
@@ -267,6 +307,17 @@ def _content_text(value) -> str:
     return ""
 
 
+def _guarded_sse(response, *, deadline, cancel_event):
+    """SSE iterator.
+
+    A deadline or cancel flag is enforced between chunks by ``iter_sse``.
+    The socket timeout stays the request timeout. Short read timeouts are not
+    used: retrying one poisons Python's buffered response.
+    """
+
+    yield from iter_sse(response, deadline=deadline, cancel_event=cancel_event)
+
+
 def _check_base_url(base_url: str, provider: Provider) -> str:
     if not base_url:
         raise APIError(
@@ -288,9 +339,21 @@ def stream_chat(
     max_tokens: int | None = None,
     timeout: float = 120.0,
     include_usage: bool = True,
+    tools: list | None = None,
+    deadline: float | None = None,
+    cancel_event=None,
 ):
-    """Yield response chunks for one completion request."""
+    """Yield response chunks for one completion request.
+
+    ``tools`` is an opt-in OpenAI-compatible tool list. Other provider kinds
+    refuse it locally. Omitting it leaves the request payload unchanged.
+    """
     base = _check_base_url(base_url or provider.base_url, provider)
+    if tools and provider.kind != OPENAI:
+        raise APIError(
+            f"Tool calls are not implemented for provider kind {provider.kind!r}.",
+            hint="Support stays unknown for this kind. No tools payload was sent.",
+        )
     if provider.kind == OPENAI:
         yield from _openai_stream(
             provider,
@@ -303,6 +366,9 @@ def stream_chat(
             max_tokens=max_tokens,
             timeout=timeout,
             include_usage=include_usage,
+            tools=tools,
+            deadline=deadline,
+            cancel_event=cancel_event,
         )
     elif provider.kind == ANTHROPIC:
         yield from _anthropic_stream(
@@ -315,6 +381,8 @@ def stream_chat(
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            deadline=deadline,
+            cancel_event=cancel_event,
         )
     elif provider.kind == GEMINI:
         yield from _gemini_stream(
@@ -327,6 +395,8 @@ def stream_chat(
             temperature=temperature,
             max_tokens=max_tokens,
             timeout=timeout,
+            deadline=deadline,
+            cancel_event=cancel_event,
         )
     else:
         raise APIError(
@@ -347,12 +417,18 @@ def _openai_stream(
     max_tokens: int | None,
     timeout: float,
     include_usage: bool,
+    tools: list | None = None,
+    deadline: float | None = None,
+    cancel_event=None,
 ):
     url = join_url(base_url, "chat/completions")
-    conversation: list[dict] = []
-    if system and system.strip():
-        conversation.append({"role": "system", "content": system})
-    conversation.extend(_normalize_messages(messages))
+    if tools:
+        conversation = _openai_tool_messages(messages, system)
+    else:
+        conversation = []
+        if system and system.strip():
+            conversation.append({"role": "system", "content": system})
+        conversation.extend(_normalize_messages(messages))
 
     payload: dict = {"model": model, "messages": conversation, "stream": True}
     if temperature is not None:
@@ -361,6 +437,8 @@ def _openai_stream(
         payload[_token_field(model)] = max_tokens
     if include_usage:
         payload["stream_options"] = {"include_usage": True}
+    if tools:
+        payload["tools"] = tools
 
     headers = provider.auth_headers(key)
     headers["Accept"] = "text/event-stream"
@@ -382,7 +460,7 @@ def _openai_stream(
             raise
 
     try:
-        for data in iter_sse(response):
+        for data in _guarded_sse(response, deadline=deadline, cancel_event=cancel_event):
             try:
                 event = json.loads(data)
             except json.JSONDecodeError:
@@ -411,6 +489,23 @@ def _openai_stream(
                     reasoning = delta.get("reasoning_content") or delta.get("reasoning")
                     if isinstance(reasoning, str) and reasoning:
                         yield Chunk(reasoning=reasoning)
+                    for call in delta.get("tool_calls") or []:
+                        if not isinstance(call, dict):
+                            continue
+                        function = call.get("function") if isinstance(call.get("function"), dict) else {}
+                        index = call["index"] if "index" in call else 0
+                        try:
+                            index = int(index)
+                        except (TypeError, ValueError):
+                            continue
+                        yield Chunk(
+                            tool_call=ToolCallDelta(
+                                index=index,
+                                id=str(call.get("id") or ""),
+                                name=str(function.get("name") or ""),
+                                arguments=str(function.get("arguments") or ""),
+                            )
+                        )
                 finish = choice.get("finish_reason")
                 if finish:
                     yield Chunk(finish_reason=str(finish))
@@ -432,6 +527,8 @@ def _anthropic_stream(
     temperature: float | None,
     max_tokens: int | None,
     timeout: float,
+    deadline: float | None = None,
+    cancel_event=None,
 ):
     if not key:
         raise AuthError(
@@ -456,7 +553,7 @@ def _anthropic_stream(
 
     response = open_stream(url, headers, payload, timeout=timeout)
     try:
-        for data in iter_sse(response):
+        for data in _guarded_sse(response, deadline=deadline, cancel_event=cancel_event):
             try:
                 event = json.loads(data)
             except json.JSONDecodeError:
@@ -519,6 +616,8 @@ def _gemini_stream(
     temperature: float | None,
     max_tokens: int | None,
     timeout: float,
+    deadline: float | None = None,
+    cancel_event=None,
 ):
     if not key:
         raise AuthError(
@@ -547,7 +646,7 @@ def _gemini_stream(
 
     response = open_stream(url, headers, payload, timeout=timeout)
     try:
-        for data in iter_sse(response):
+        for data in _guarded_sse(response, deadline=deadline, cancel_event=cancel_event):
             try:
                 event = json.loads(data)
             except json.JSONDecodeError:

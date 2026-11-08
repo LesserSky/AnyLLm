@@ -477,8 +477,14 @@ class CliPresentationTests(ServerTestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "Hello from mock\n")
-        self.assertEqual(result.stderr, "")
         self.assertNotIn("\x1b", result.stdout)
+        self.assertNotIn("\x1b", result.stderr)
+        self.assertNotIn(TEST_KEY, result.stdout)
+        self.assertNotIn(TEST_KEY, result.stderr)
+        # Explicit --base-url still sends the provider key and says so.
+        # The warning is one plain line, not color and not the secret.
+        self.assertIn("still sends the openai key", result.stderr)
+        self.assertEqual(result.stderr.count("\n"), 1)
 
     def test_piped_ask_no_stream_and_chat_stay_plain(self):
         home = self.temp_home()

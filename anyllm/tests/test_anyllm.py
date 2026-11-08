@@ -551,6 +551,125 @@ class CliTests(ServerTestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("authentication failed", result.stderr.lower())
 
+    def test_explicit_base_url_forwards_provider_key_and_warns(self):
+        home = self.temp_home()
+        url = f"{self.base}/openai/v1"
+        commands = [
+            ["ask", "--provider", "openai", "--base-url", url, "--model", "mock", "hi"],
+            ["chat", "--provider", "openai", "--base-url", url, "--model", "mock"],
+            ["models", "openai", "--base-url", url],
+        ]
+        for command in commands:
+            with self.subTest(command=command[0]):
+                before = len(self.state.requests)
+                result = self.run_cli(
+                    command,
+                    home,
+                    input_text="hi\n" if command[0] == "chat" else None,
+                    extra_env={"OPENAI_API_KEY": TEST_KEY},
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("still sends the openai key", result.stderr)
+                self.assertIn(url, result.stderr)
+                self.assertNotIn("\n", result.stderr.strip())
+                self.assertNotIn(TEST_KEY, result.stderr)
+                self.assertNotIn(TEST_KEY, result.stdout)
+                self.assertNotIn("not encrypted", result.stderr)
+                sent = self.state.requests[before:]
+                self.assertTrue(sent)
+                self.assertEqual(sent[-1]["headers"].get("Authorization"), f"Bearer {TEST_KEY}")
+
+        queried = url + "?api-version=2024-10-21"
+        before = len(self.state.requests)
+        queried_result = self.run_cli(
+            ["ask", "--provider", "openai", "--base-url", queried, "--model", "mock", "hi"],
+            home,
+            extra_env={"OPENAI_API_KEY": TEST_KEY},
+        )
+        self.assertEqual(queried_result.returncode, 0, queried_result.stderr)
+        self.assertIn("still sends the openai key", queried_result.stderr)
+        self.assertNotIn(TEST_KEY, queried_result.stderr)
+        self.assertEqual(
+            self.state.requests[before]["headers"].get("Authorization"),
+            f"Bearer {TEST_KEY}",
+        )
+
+    def test_normalized_configured_endpoint_does_not_warn(self):
+        home = self.temp_home()
+        url = f"{self.base}/openai/v1"
+        added = self.run_cli(
+            ["providers", "add", "lab", "--base-url", url, "--model", "mock"],
+            home,
+        )
+        self.assertEqual(added.returncode, 0, added.stderr)
+        keyed = self.run_cli(["keys", "set", "lab", "--stdin"], home, input_text=TEST_KEY + "\n")
+        self.assertEqual(keyed.returncode, 0, keyed.stderr)
+        before = len(self.state.requests)
+        result = self.run_cli(
+            ["ask", "--provider", "lab", "--base-url", url + "/", "--model", "mock", "hi"],
+            home,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("still sends", result.stderr)
+        self.assertEqual(
+            self.state.requests[before]["headers"].get("Authorization"),
+            f"Bearer {TEST_KEY}",
+        )
+
+    def test_target_and_saved_session_do_not_forward_the_provider_key(self):
+        home = self.temp_home()
+        url = f"{self.base}/openai/v1"
+        added = self.run_cli(
+            ["targets", "add", "lab", "--provider", "openai", "--model", "mock", "--base-url", url],
+            home,
+        )
+        self.assertEqual(added.returncode, 0, added.stderr)
+        keyed = self.run_cli(
+            ["keys", "set", "target:lab", "--stdin"],
+            home,
+            input_text=TEST_KEY + "\n",
+        )
+        self.assertEqual(keyed.returncode, 0, keyed.stderr)
+        before = len(self.state.requests)
+        asked = self.run_cli(
+            ["ask", "--target", "lab", "hi"],
+            home,
+            extra_env={"OPENAI_API_KEY": "provider-sentinel"},
+        )
+        self.assertEqual(asked.returncode, 0, asked.stderr)
+        self.assertNotIn("still sends the openai key", asked.stderr)
+        self.assertNotIn("provider-sentinel", asked.stderr)
+        self.assertNotIn("provider-sentinel", asked.stdout)
+        self.assertEqual(
+            self.state.requests[before]["headers"].get("Authorization"),
+            f"Bearer {TEST_KEY}",
+        )
+        directory = home / "sessions"
+        directory.mkdir(parents=True)
+        (directory / "old.json").write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "provider": "openai",
+                    "model": "mock",
+                    "base_url": url,
+                    "messages": [{"role": "user", "content": "earlier"}],
+                }
+            ),
+            encoding="utf-8",
+        )
+        posted = len(self.state.requests)
+        loaded = self.run_cli(
+            ["chat", "--load", "old", "--timeout", "5"],
+            home,
+            input_text="hi\n",
+            extra_env={"OPENAI_API_KEY": "provider-sentinel"},
+        )
+        self.assertEqual(loaded.returncode, 1, loaded.stdout)
+        self.assertIn("Refusing to send the openai key", loaded.stderr)
+        self.assertNotIn("provider-sentinel", loaded.stderr)
+        self.assertEqual(self._posts_since(posted), [])
+
     def test_models_command(self):
         home = self.temp_home()
         result = self.run_cli(
@@ -612,7 +731,16 @@ class BaseUrlTests(ServerTestCase):
         home = self.temp_home()
         with mock.patch.dict(os.environ, {"ANYLLM_HOME": str(home)}):
             store = KeyStore()
-            store.set("mock", TEST_KEY)
+            store.set("target:azureish", TEST_KEY)
+            from anyllm.targets import add_target
+
+            add_target(
+                "azureish",
+                provider="mock",
+                model="mock",
+                base_url=custom,
+                providers={"mock": provider},
+            )
             session = Session(
                 provider,
                 "mock",
@@ -621,6 +749,7 @@ class BaseUrlTests(ServerTestCase):
                 temperature=0.0,
                 max_tokens=8,
             )
+            session.target_alias = "azureish"
             session.messages = [
                 {"role": "user", "content": "hi"},
                 {"role": "assistant", "content": "yo"},
@@ -659,10 +788,10 @@ class BaseUrlTests(ServerTestCase):
 
             args.base_url = "http://127.0.0.1:9/v1"
             with redirect_stdout(io.StringIO()):
-                overridden = _session_from_saved(
-                    "demo", args, {"mock": provider}, store, Style(False)
-                )
-            self.assertEqual(overridden.base_url, "http://127.0.0.1:9/v1")
+                with self.assertRaises(ConfigError) as moved:
+                    _session_from_saved("demo", args, {"mock": provider}, store, Style(False))
+            self.assertIn("127.0.0.1:9", str(moved.exception))
+            self.assertNotIn(TEST_KEY, str(moved.exception))
 
     def test_old_session_without_base_url_uses_provider_default(self):
         provider = Provider(
@@ -714,14 +843,9 @@ class BaseUrlTests(ServerTestCase):
             input_text="hi\n",
             extra_env={"OPENAI_API_KEY": TEST_KEY},
         )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Hello from mock", result.stdout)
-        self.assertIn("resumed demo", result.stdout)
-        posts = self._posts_since(before)
-        self.assertEqual(len(posts), 1)
-        self.assertEqual(posts[0]["path"], "/openai/v1/chat/completions")
-        roles = [item["role"] for item in posts[0]["payload"]["messages"]]
-        self.assertEqual(roles, ["user", "assistant", "user"])
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("Refusing to send the openai key", result.stderr)
+        self.assertEqual(self._posts_since(before), [])
 
     def test_chat_load_rejects_bad_sampling_before_request(self):
         home = self.temp_home()
@@ -747,6 +871,117 @@ class BaseUrlTests(ServerTestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("temperature", result.stderr.lower())
         self.assertEqual(self._posts_since(before), [])
+
+    def test_interactive_explicit_base_url_send_models_then_load_stays_strict(self):
+        home = self.temp_home()
+        url = f"{self.base}/openai/v1"
+        with mock.patch.dict(
+            os.environ,
+            {"ANYLLM_HOME": str(home), "NO_COLOR": "1", "OPENAI_API_KEY": TEST_KEY},
+            clear=False,
+        ):
+            config = load_config()
+            providers = load_providers(config)
+            store = KeyStore()
+            session = Session(
+                BUILTINS["openai"],
+                "mock",
+                base_url=url,
+                api_key=TEST_KEY,
+                key_source="env:OPENAI_API_KEY",
+                timeout=10,
+            )
+            session.explicit_endpoint = url
+            repl = Repl(session, Style(False), providers, store, config)
+            before = len(self.state.requests)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                repl._send("hi")
+            sent = self.state.requests[before:]
+            self.assertTrue(sent)
+            self.assertEqual(sent[-1]["headers"].get("Authorization"), f"Bearer {TEST_KEY}")
+            self.assertIn("Hello from mock", output.getvalue())
+            before = len(self.state.requests)
+            with redirect_stdout(io.StringIO()):
+                repl._cmd_models("")
+            listed = self.state.requests[before:]
+            self.assertTrue(any(item.get("method") == "GET" for item in listed))
+            self.assertTrue(
+                all(
+                    item["headers"].get("Authorization") == f"Bearer {TEST_KEY}"
+                    for item in listed
+                )
+            )
+            with redirect_stdout(io.StringIO()):
+                repl._cmd_save("demo")
+            saved = json.loads((home / "sessions" / "demo.json").read_text(encoding="utf-8"))
+            self.assertEqual(saved["base_url"], url)
+            self.assertNotIn("explicit_endpoint", saved)
+            self.assertNotIn(TEST_KEY, json.dumps(saved))
+            live_key = repl.session.api_key
+            with self.assertRaises(ConfigError) as caught:
+                repl._cmd_load("demo")
+            self.assertIn("Refusing to send the openai key", str(caught.exception))
+            self.assertIs(repl.session, session)
+            self.assertEqual(repl.session.api_key, live_key)
+            self.assertEqual(repl.session.explicit_endpoint, url)
+            posted = len(self.state.requests)
+            fresh = Repl(
+                Session(BUILTINS["openai"], "mock", api_key=TEST_KEY, timeout=10),
+                Style(False),
+                providers,
+                store,
+                config,
+            )
+            with self.assertRaises(ConfigError) as resumed:
+                fresh._cmd_load("demo")
+            self.assertIn("Refusing to send the openai key", str(resumed.exception))
+            self.assertFalse(hasattr(fresh.session, "explicit_endpoint") and fresh.session.explicit_endpoint)
+            self.assertEqual(self._posts_since(posted), [])
+            # The live permission is this URL only. Another host does not inherit it.
+            repl.session.base_url = "http://127.0.0.1:9/v1"
+            quiet = len(self.state.requests)
+            with self.assertRaises(ConfigError) as moved:
+                repl._send("nope")
+            self.assertIn("Refusing to send the openai key", str(moved.exception))
+            self.assertEqual(self._posts_since(quiet), [])
+
+            from anyllm.targets import add_target, repl_target
+
+            add_target(
+                "lab",
+                provider="openai",
+                model="mock",
+                base_url=url,
+                providers=providers,
+            )
+            os.environ["ANYLLM_TARGET_LAB_API_KEY"] = "target-sentinel"
+            try:
+                target_session = Session(
+                    BUILTINS["openai"],
+                    "mock",
+                    base_url=url,
+                    api_key=TEST_KEY,
+                    timeout=10,
+                )
+                target_session.explicit_endpoint = url
+                target_repl = Repl(target_session, Style(False), providers, store, config)
+                with redirect_stdout(io.StringIO()):
+                    repl_target(target_repl, "lab")
+                self.assertIsNone(target_repl.session.explicit_endpoint)
+                self.assertEqual(target_repl.session.api_key, "target-sentinel")
+                marked = len(self.state.requests)
+                with redirect_stdout(io.StringIO()):
+                    target_repl._send("hi")
+                auths = [
+                    item["headers"].get("Authorization")
+                    for item in self.state.requests[marked:]
+                    if item.get("method") == "POST"
+                ]
+                self.assertEqual(auths, ["Bearer target-sentinel"])
+                self.assertNotIn("Bearer " + TEST_KEY, auths)
+            finally:
+                os.environ.pop("ANYLLM_TARGET_LAB_API_KEY", None)
 
 
 class SamplingValidationTests(unittest.TestCase):
@@ -985,11 +1220,13 @@ class ProviderCommandTests(ServerTestCase):
             self.assertEqual(repl.session.messages[0]["content"], "keep me")
 
             with redirect_stdout(output):
-                repl._cmd_provider("openai")
+                with self.assertRaises(ConfigError) as withheld:
+                    repl._cmd_provider("openai")
+            self.assertIn("Refusing to send", str(withheld.exception))
             self.assertEqual(repl.session.provider.name, "openai")
             self.assertEqual(repl.session.base_url, "https://proxy.example/v1")
             self.assertEqual(repl.session.model, "gpt-custom")
-            self.assertEqual(repl.session.api_key, "sk-openai")
+            self.assertIsNone(repl.session.api_key)
 
             held = os.environ.pop("GROQ_API_KEY")
             try:

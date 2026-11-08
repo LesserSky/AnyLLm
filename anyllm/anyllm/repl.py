@@ -12,7 +12,15 @@ from .adapters import Usage, list_models
 from .catalog import get_provider
 from .config import ensure_config_dir, history_path, validate_max_tokens, validate_temperature
 from .errors import AnyLLMError, ConfigError
-from .keystore import KeyStore, mask_key, resolve_key
+from .keystore import KeyStore, resolve_key
+from .targets import (
+    describe_live_key,
+    missing_endpoint_key,
+    rebind_session_credentials,
+    resolve_endpoint_key,
+    saved_target_alias,
+)
+from .seam import HELP_ROWS, REPL_HANDLERS, install_repl_features
 from .session import (
     Session,
     Turn,
@@ -183,6 +191,7 @@ class Repl:
         self.config = config
         self.running = True
         self._readline = None
+        install_repl_features()
         self._setup_readline()
 
     # -- session plumbing ---------------------------------------------------
@@ -273,6 +282,7 @@ class Repl:
         return 0
 
     def _send(self, text: str) -> None:
+        rebind_session_credentials(self.session, self.providers, self.store)
         printer = StreamPrinter(
             self.style,
             show_reasoning=self.session.show_reasoning,
@@ -312,12 +322,18 @@ class Repl:
         name = parts[0].lower()
         rest = parts[1].strip() if len(parts) > 1 else ""
         handler = getattr(self, f"_cmd_{name}", None)
+        extra = None
         if handler is None:
-            print(self.style.yellow(f"unknown command /{name}"))
-            print(self.style.dim("  /help lists commands; //text sends a message starting with a slash"))
-            return
+            extra = REPL_HANDLERS.get(name)
+            if extra is None:
+                print(self.style.yellow(f"unknown command /{name}"))
+                print(self.style.dim("  /help lists commands; //text sends a message starting with a slash"))
+                return
         try:
-            handler(rest)
+            if extra is not None:
+                extra(self, rest)
+            else:
+                handler(rest)
         except AnyLLMError as exc:
             self.error(exc)
         except (ValueError, TypeError) as exc:
@@ -334,7 +350,7 @@ class Repl:
             ("/max [N]", "show or set maximum response tokens ('off' clears)"),
             ("/reasoning on|off", "show or hide the model's thinking stream"),
             ("/clear", "start a new conversation"),
-            ("/usage", "session token totals"),
+            ("/usage [--cost]", "session totals; --cost estimates from saved rates"),
             ("/info", "connection details"),
             ("/save [NAME]", "save this conversation"),
             ("/load [NAME]", "load a saved conversation (latest by default)"),
@@ -342,6 +358,7 @@ class Repl:
             ("/keys", "show which key this provider uses"),
             ("/exit", "quit"),
         ]
+        rows.extend(HELP_ROWS)
         print(self.style.bold("Commands"))
         for line in format_table(self.style, ["COMMAND", "ACTION"], rows):
             print("  " + line)
@@ -359,16 +376,11 @@ class Repl:
         print(self.style.dim(f"model → {rest} (this conversation only)"))
 
     def _cmd_models(self, rest: str) -> None:
-        key = resolve_key(self.session.provider, self.store)
-        if self.session.provider.key_required and not key.value:
-            raise ConfigError(
-                f"No API key for {self.session.provider.name}.",
-                hint=f"Run `anyllm keys set {self.session.provider.name}`.",
-            )
+        rebind_session_credentials(self.session, self.providers, self.store)
         print(self.style.dim("fetching models…"))
         models = list_models(
             self.session.provider,
-            key=key.value,
+            key=self.session.api_key,
             base_url=self.session.base_url,
             timeout=min(self.session.timeout, 60.0),
         )
@@ -418,16 +430,24 @@ class Repl:
                 hint="Add a named endpoint with `anyllm providers add NAME --base-url URL`, "
                 "or start the chat with --base-url. The current provider was left unchanged.",
             )
-        key = resolve_key(provider, self.store)
-        if provider.key_required and not key.value:
-            raise ConfigError(
-                f"No API key for {provider.name}.",
-                hint=f"Run `anyllm keys set {provider.name}`, then /provider {provider.name} again.",
-            )
         old_model = self.session.model
-        self.session.provider = provider
-        self.session.api_key = key.value
-        self.session.key_source = key.source
+        if switching:
+            key = resolve_key(provider, self.store)
+            if provider.key_required and not key.value:
+                raise ConfigError(
+                    f"No API key for {provider.name}.",
+                    hint=f"Run `anyllm keys set {provider.name}`, then /provider {provider.name} again.",
+                )
+            self.session.provider = provider
+            self.session.api_key = key.value
+            self.session.key_source = key.source
+            self.session.target_alias = None
+            self.session.explicit_endpoint = None
+        else:
+            # Same provider keeps the current host and target identity.
+            # Re-resolve with that identity so a provider key cannot replace a target key.
+            self.session.provider = provider
+            rebind_session_credentials(self.session, self.providers, self.store)
         if switching:
             # The previous endpoint and model belonged to the previous provider.
             # Keep history, but do not keep a stale model when the new provider
@@ -516,7 +536,14 @@ class Repl:
         self.session.turns = 0
         print(self.style.dim("conversation cleared"))
 
-    def _cmd_usage(self, _rest: str) -> None:
+    def _cmd_usage(self, rest: str) -> None:
+        if rest.strip() == "--cost":
+            from .budgets import repl_usage_cost
+
+            repl_usage_cost(self)
+            return
+        if rest.strip():
+            raise ConfigError("Usage: /usage or /usage --cost")
         usage = self.session.usage
         if usage.total is None and not self.session.turns:
             print(self.style.dim("no requests in this session yet"))
@@ -541,16 +568,7 @@ class Repl:
         print(f"  model:     {self.style.bold(session.model)}")
         endpoint = redact_endpoint(session.base_url, session.api_key)
         print(f"  endpoint:  {self.style.muted(endpoint)}")
-        key = resolve_key(provider, self.store)
-        if not provider.key_required:
-            key_text = "not needed"
-        elif key.stored:
-            key_text = f"saved ({mask_key(key.value or '')})"
-        elif key.env_var:
-            key_text = f"environment ({key.env_var})"
-        else:
-            key_text = "missing"
-        print(f"  key:       {key_text}")
+        print(f"  key:       {describe_live_key(session, self.providers, self.store)}")
         print(f"  system:    {session.system or '(none)'}")
         print(f"  messages:  {len(session.messages)}")
         print(f"  timeout:   {session.timeout:g}s")
@@ -558,17 +576,16 @@ class Repl:
 
     def _cmd_keys(self, _rest: str) -> None:
         provider = self.session.provider
-        key = resolve_key(provider, self.store)
-        if not provider.key_required:
+        label = describe_live_key(self.session, self.providers, self.store)
+        if label == "not needed":
             print(self.style.dim(f"{provider.name} does not need an API key"))
             return
-        if key.stored:
-            print(f"{provider.name}: saved key {mask_key(key.value or '')}")
-        elif key.env_var:
-            print(f"{provider.name}: from environment variable {key.env_var}")
-        else:
-            print(self.style.yellow(f"{provider.name}: no key configured"))
-            print(self.style.dim(f"  run: anyllm keys set {provider.name}"))
+        if label.startswith("withheld"):
+            print(self.style.yellow(f"{provider.name}: provider key withheld for this host"))
+            alias = getattr(self.session, "target_alias", None)
+            print(self.style.dim("  " + missing_endpoint_key(provider, self.session.base_url, alias).hint))
+            return
+        print(f"{provider.name}: {label}")
 
     def _cmd_save(self, rest: str) -> None:
         if not self.session.messages:
@@ -585,12 +602,6 @@ class Repl:
             )
         data = load_session_data(name)
         provider = get_provider(str(data["provider"]), self.providers)
-        key = resolve_key(provider, self.store)
-        if provider.key_required and not key.value:
-            raise ConfigError(
-                f"No API key for {provider.name}.",
-                hint=f"Run `anyllm keys set {provider.name}`, then /load {name} again.",
-            )
         model = data.get("model") or provider.default_model
         if not isinstance(model, str) or not model.strip():
             raise ConfigError(f"Session {name!r} has no model.")
@@ -598,12 +609,22 @@ class Repl:
         temperature = validate_temperature(data.get("temperature"))
         max_tokens = validate_max_tokens(data.get("max_tokens"))
         base_url = session_base_url(data, provider)
+        alias = saved_target_alias(data)
+        credential, source = resolve_endpoint_key(
+            provider,
+            base_url,
+            target_alias=alias,
+            store=self.store,
+            providers=self.providers,
+        )
+        if provider.key_required and not credential:
+            raise missing_endpoint_key(provider, base_url, alias)
         self.session = Session(
             provider,
             model,
             base_url=base_url,
-            api_key=key.value,
-            key_source=key.source,
+            api_key=credential,
+            key_source=source,
             system=data.get("system"),
             temperature=temperature,
             max_tokens=max_tokens,
@@ -612,6 +633,7 @@ class Repl:
             messages=data.get("messages") or [],
             usage=Usage.from_dict(data.get("usage")),
         )
+        self.session.target_alias = alias
         print(
             self.style.dim(
                 f"loaded {name} · {provider.name}/{model} · {len(self.session.messages)} messages"
