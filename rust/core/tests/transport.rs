@@ -1,14 +1,14 @@
 use std::io::{Cursor, Read};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyllm_core::errors::ErrorKind;
 use anyllm_core::transport::{
-    iter_sse, iter_sse_controlled, join_url, raise_for_status, request_json, user_agent,
-    MAX_RETRIES,
+    iter_sse, iter_sse_controlled, join_url, open_stream_controlled, raise_for_status,
+    request_json, user_agent, MAX_RETRIES,
 };
 use serde_json::json;
 
@@ -267,6 +267,127 @@ fn json_request_applies_read_timeout_before_status_line() {
     let error =
         request_json(&format!("http://{address}/slow"), &[], None, "GET", 0.1, 0).unwrap_err();
     assert_eq!(error.kind, ErrorKind::Network);
+    assert!(started.elapsed() < Duration::from_millis(220));
+    server.join().unwrap();
+}
+
+#[test]
+fn controlled_open_checks_cancellation_before_opening_request() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let cancelled = Arc::new(AtomicBool::new(true));
+    let error = open_stream_controlled(
+        &format!("http://{address}/stream"),
+        &[],
+        &json!({"stream":true}),
+        1.0,
+        2,
+        None,
+        Some(cancelled),
+    )
+    .err()
+    .expect("cancelled request must fail");
+    assert!(error.message.contains("cancel"));
+    assert!(listener.accept().is_err(), "cancelled request was sent");
+}
+
+#[test]
+fn controlled_open_interrupts_retry_delay_on_cancellation() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let server_cancelled = Arc::clone(&cancelled);
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _ = read_request(&mut stream);
+        respond(
+            &mut stream,
+            "503 Service Unavailable",
+            "Retry-After: 2\r\n",
+            "{}",
+        );
+        thread::sleep(Duration::from_millis(20));
+        server_cancelled.store(true, Ordering::Relaxed);
+        listener.set_nonblocking(true).unwrap();
+        assert!(listener.accept().is_err(), "cancelled retry was sent");
+    });
+
+    let started = Instant::now();
+    let error = open_stream_controlled(
+        &format!("http://{address}/stream"),
+        &[],
+        &json!({"stream":true}),
+        2.0,
+        2,
+        None,
+        Some(cancelled),
+    )
+    .err()
+    .expect("cancelled retry must fail");
+    assert!(error.message.contains("cancel"));
+    assert!(started.elapsed() < Duration::from_millis(500));
+    server.join().unwrap();
+}
+
+#[test]
+fn controlled_open_deadline_interrupts_retry_wait() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _ = read_request(&mut stream);
+        respond(
+            &mut stream,
+            "503 Service Unavailable",
+            "Retry-After: 2\r\n",
+            "{}",
+        );
+        listener.set_nonblocking(true).unwrap();
+        assert!(listener.accept().is_err(), "request ran past its deadline");
+    });
+
+    let started = Instant::now();
+    let error = open_stream_controlled(
+        &format!("http://{address}/stream"),
+        &[],
+        &json!({"stream":true}),
+        2.0,
+        2,
+        Some(started + Duration::from_millis(100)),
+        None,
+    )
+    .err()
+    .expect("deadline must stop retry");
+    assert!(error.message.contains("deadline"));
+    assert!(started.elapsed() < Duration::from_millis(500));
+    server.join().unwrap();
+}
+
+#[test]
+fn controlled_open_deadline_bounds_a_blocked_request_attempt() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let _ = read_request(&mut stream);
+        thread::sleep(Duration::from_millis(250));
+        respond(&mut stream, "200 OK", "", "{}");
+    });
+
+    let started = Instant::now();
+    let error = open_stream_controlled(
+        &format!("http://{address}/stream"),
+        &[],
+        &json!({"stream":true}),
+        2.0,
+        0,
+        Some(started + Duration::from_millis(100)),
+        None,
+    )
+    .err()
+    .expect("deadline must stop the request attempt");
+    assert!(error.message.contains("deadline"));
     assert!(started.elapsed() < Duration::from_millis(220));
     server.join().unwrap();
 }

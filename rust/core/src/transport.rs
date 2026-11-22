@@ -359,6 +359,100 @@ fn network_error(message: &str, url: &str) -> AnyLLMError {
     AnyLLMError::network(format!("could not reach {}: {}", host, message)).with_hint(hint)
 }
 
+#[derive(Clone)]
+struct RequestControl {
+    deadline: Option<Instant>,
+    cancelled: Option<Arc<AtomicBool>>,
+}
+
+fn request_stopped(control: &RequestControl, url: &str) -> Option<AnyLLMError> {
+    if control
+        .cancelled
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    {
+        return Some(local_open_stop_error(
+            "Streaming request stopped locally after a cancel. The provider request may have started.",
+            url,
+        ));
+    }
+    if control
+        .deadline
+        .is_some_and(|deadline| Instant::now() >= deadline)
+    {
+        return Some(local_open_stop_error(
+            "The overall deadline elapsed while opening the streaming request. The provider request may have started.",
+            url,
+        ));
+    }
+    None
+}
+
+fn local_open_stop_error(message: &str, url: &str) -> AnyLLMError {
+    AnyLLMError::network(format!("{} ({})", message, netloc_of(url))).with_hint(
+        "The provider may still be generating and may still charge for this request. Stopping locally does not cancel it on the server.",
+    )
+}
+
+fn attempt_timeout(timeout: f64, control: Option<&RequestControl>, url: &str) -> Result<f64> {
+    let Some(control) = control else {
+        return Ok(timeout.max(0.1));
+    };
+    if let Some(error) = request_stopped(control, url) {
+        return Err(error);
+    }
+    let remaining = control.deadline.map(|deadline| {
+        deadline
+            .saturating_duration_since(Instant::now())
+            .as_secs_f64()
+    });
+    Ok(remaining
+        .map_or(timeout, |remaining| timeout.min(remaining))
+        .max(0.001))
+}
+
+fn wait_before_retry(delay: f64, control: Option<&RequestControl>, url: &str) -> Result<()> {
+    let Some(control) = control else {
+        std::thread::sleep(Duration::from_secs_f64(delay));
+        return Ok(());
+    };
+    let until = Instant::now() + Duration::from_secs_f64(delay);
+    loop {
+        if let Some(error) = request_stopped(control, url) {
+            return Err(error);
+        }
+        let remaining = until.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(20)));
+    }
+}
+
+fn read_status_body(
+    response: ureq::Response,
+    control: Option<&RequestControl>,
+    url: &str,
+) -> Result<Vec<u8>> {
+    let mut reader = response.into_reader();
+    let mut body = Vec::new();
+    let Some(control) = control else {
+        let _ = reader.read_to_end(&mut body);
+        return Ok(body);
+    };
+    let mut chunk = [0; 8192];
+    loop {
+        if let Some(error) = request_stopped(control, url) {
+            return Err(error);
+        }
+        match reader.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => body.extend_from_slice(&chunk[..read]),
+        }
+    }
+    Ok(body)
+}
+
 /// Open a URL, retrying only failures that are safe to send again.
 fn open(
     method: &str,
@@ -369,13 +463,42 @@ fn open(
     retries: usize,
     replay_safe: bool,
 ) -> Result<Box<dyn Read + Send + Sync>> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs_f64(timeout.max(0.1)))
-        .timeout_read(Duration::from_secs_f64(timeout.max(0.1)))
-        .timeout_write(Duration::from_secs_f64(timeout.max(0.1)))
-        .build();
+    open_with_control(
+        method,
+        url,
+        data,
+        headers,
+        timeout,
+        retries,
+        replay_safe,
+        None,
+    )
+}
+
+fn open_with_control(
+    method: &str,
+    url: &str,
+    data: Option<&Vec<u8>>,
+    headers: &[(String, String)],
+    timeout: f64,
+    retries: usize,
+    replay_safe: bool,
+    control: Option<&RequestControl>,
+) -> Result<Box<dyn Read + Send + Sync>> {
     let mut attempt = 0;
     loop {
+        if let Some(control) = control {
+            if let Some(error) = request_stopped(control, url) {
+                return Err(error);
+            }
+        }
+        let timeout = attempt_timeout(timeout, control, url)?;
+        let timeout = Duration::from_secs_f64(timeout);
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(timeout)
+            .timeout_read(timeout)
+            .timeout_write(timeout)
+            .build();
         let mut request = agent
             .request(method, url)
             .set("User-Agent", &user_agent())
@@ -389,16 +512,19 @@ fn open(
         };
         match outcome {
             Ok(response) => {
+                if let Some(control) = control {
+                    if let Some(error) = request_stopped(control, url) {
+                        return Err(error);
+                    }
+                }
                 return Ok(response.into_reader());
             }
             Err(ureq::Error::Status(status, response)) => {
                 let retry_after = response.header("Retry-After").map(str::to_string);
-                let mut body = Vec::new();
-                let mut reader = response.into_reader();
-                let _ = reader.read_to_end(&mut body);
+                let body = read_status_body(response, control, url)?;
                 if attempt < retries && should_retry_status(status, replay_safe) {
                     if let Some(delay) = retry_delay(retry_after.as_deref(), attempt) {
-                        std::thread::sleep(Duration::from_secs_f64(delay));
+                        wait_before_retry(delay, control, url)?;
                         attempt += 1;
                         continue;
                     }
@@ -407,11 +533,16 @@ fn open(
             }
             Err(ureq::Error::Transport(transport)) => {
                 let text = transport.to_string();
+                if let Some(control) = control {
+                    if let Some(error) = request_stopped(control, url) {
+                        return Err(error);
+                    }
+                }
                 if attempt < retries
                     && !is_tls_failure(&text)
                     && (replay_safe || failed_before_send(&text))
                 {
-                    std::thread::sleep(Duration::from_secs_f64(0.6 * (attempt as f64 + 1.0)));
+                    wait_before_retry(0.6 * (attempt as f64 + 1.0), control, url)?;
                     attempt += 1;
                     continue;
                 }
@@ -439,6 +570,39 @@ pub fn open_stream(
     let data = serialize_payload(payload);
     let reader = open("POST", url, Some(&data), headers, timeout, retries, false)?;
     Ok(reader)
+}
+
+/// POST JSON and return a streaming response while observing local controls.
+///
+/// Deadline checks are applied before every attempt and retry, and the
+/// remaining time bounds connection, read, and write operations. Cancellation
+/// is checked before and after each blocking request operation and every 20ms
+/// during retry waits. A blocking HTTP operation itself cannot be interrupted
+/// through `ureq`, so cancellation may be delayed by that operation's timeout.
+pub fn open_stream_controlled(
+    url: &str,
+    headers: &[(String, String)],
+    payload: &Value,
+    timeout: f64,
+    retries: usize,
+    deadline: Option<Instant>,
+    cancelled: Option<Arc<AtomicBool>>,
+) -> Result<Box<dyn Read + Send + Sync>> {
+    let data = serialize_payload(payload);
+    let control = RequestControl {
+        deadline,
+        cancelled,
+    };
+    open_with_control(
+        "POST",
+        url,
+        Some(&data),
+        headers,
+        timeout,
+        retries,
+        false,
+        Some(&control),
+    )
 }
 
 /// Perform a request and decode a JSON object or array.
