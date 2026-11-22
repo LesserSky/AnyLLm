@@ -1,5 +1,7 @@
 use std::io::{Cursor, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::Mutex;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -348,4 +350,68 @@ fn cancelled_or_expired_request_fails_before_opening_connection() {
         Ok(_) => panic!("expected deadline error"),
     };
     assert!(error.message.contains("overall deadline elapsed"));
+}
+
+struct PausedReader {
+    entered: SyncSender<()>,
+    release: Mutex<Receiver<()>>,
+}
+
+impl Read for PausedReader {
+    fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+        let _ = self.entered.send(());
+        let _ = self.release.lock().unwrap().recv();
+        Ok(0)
+    }
+}
+
+#[test]
+fn controlled_chunk_stream_stops_delivery_when_cancelled() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+    let (release_tx, release_rx) = mpsc::channel();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let mut stream = ChunkStream::from_controlled_reader(
+        OPENAI,
+        "Mock",
+        Box::new(PausedReader {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        }),
+        None,
+        Arc::clone(&cancelled),
+    );
+
+    entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    cancelled.store(true, Ordering::Relaxed);
+    let error = stream.next_chunk().unwrap_err();
+    assert!(error.message.contains("stopped locally after a cancel"));
+    release_tx.send(()).unwrap();
+}
+
+#[test]
+fn controlled_chunk_stream_observes_absolute_deadline() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    let (entered_tx, entered_rx) = mpsc::sync_channel(0);
+    let (release_tx, release_rx) = mpsc::channel();
+    let mut stream = ChunkStream::from_controlled_reader(
+        OPENAI,
+        "Mock",
+        Box::new(PausedReader {
+            entered: entered_tx,
+            release: Mutex::new(release_rx),
+        }),
+        Some(Instant::now() + Duration::from_millis(50)),
+        Arc::new(AtomicBool::new(false)),
+    );
+
+    entered_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    let error = stream.next_chunk().unwrap_err();
+    assert!(error.message.contains("overall deadline elapsed"));
+    release_tx.send(()).unwrap();
 }

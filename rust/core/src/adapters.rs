@@ -14,7 +14,8 @@ use serde_json::{json, Map, Value};
 use crate::catalog::{Provider, ANTHROPIC, GEMINI, OPENAI};
 use crate::errors::{AnyLLMError, ErrorKind, Result};
 use crate::transport::{
-    iter_sse_controlled, join_url, open_stream, request_json, ControlledSseIterator, SseReader,
+    iter_sse_controlled, join_url, open_stream_controlled, request_json, ControlledSseIterator,
+    SseReader,
 };
 
 /// One conversation turn as sent to a provider.
@@ -529,6 +530,23 @@ fn request_timeout(args: &StreamArgs<'_>) -> Result<f64> {
     Ok(args.timeout.min(remaining))
 }
 
+fn open_adapter_stream(
+    url: &str,
+    headers: &[(String, String)],
+    payload: &Value,
+    args: &StreamArgs<'_>,
+) -> Result<Box<dyn Read + Send + Sync>> {
+    open_stream_controlled(
+        url,
+        headers,
+        payload,
+        request_timeout(args)?,
+        2,
+        args.deadline,
+        args.cancel.clone(),
+    )
+}
+
 fn chunk_stream(
     kind: &str,
     label: &str,
@@ -638,6 +656,9 @@ impl ChunkStream {
     }
 
     /// Wrap an open SSE response with cooperative deadline and cancellation.
+    ///
+    /// Cancellation stops local delivery; an underlying blocking read may
+    /// remain active until the transport returns or its I/O timeout expires.
     pub fn from_controlled_reader(
         kind: &str,
         label: &str,
@@ -984,8 +1005,7 @@ pub fn stream_chat(provider: &Provider, args: &StreamArgs) -> Result<ChunkStream
             if args.include_usage {
                 payload["stream_options"] = json!({"include_usage": true});
             }
-            let timeout = request_timeout(args)?;
-            let reader = match open_stream(&url, &headers, &payload, timeout, 2) {
+            let reader = match open_adapter_stream(&url, &headers, &payload, args) {
                 Ok(reader) => reader,
                 Err(err) => {
                     // Some OpenAI-compatible servers reject stream_options.
@@ -999,7 +1019,7 @@ pub fn stream_chat(provider: &Provider, args: &StreamArgs) -> Result<ChunkStream
                             .as_object_mut()
                             .expect("payload is an object")
                             .remove("stream_options");
-                        open_stream(&url, &headers, &payload, request_timeout(args)?, 2)?
+                        open_adapter_stream(&url, &headers, &payload, args)?
                     } else {
                         return Err(err);
                     }
@@ -1034,7 +1054,7 @@ pub fn stream_chat(provider: &Provider, args: &StreamArgs) -> Result<ChunkStream
             let mut headers = provider.auth_headers(args.key);
             headers.push(("anthropic-version".to_string(), "2023-06-01".to_string()));
             headers.extend(accept_sse());
-            let reader = open_stream(&url, &headers, &payload, request_timeout(args)?, 2)?;
+            let reader = open_adapter_stream(&url, &headers, &payload, args)?;
             Ok(chunk_stream(ANTHROPIC, &provider.label, reader, args))
         }
         GEMINI => {
@@ -1072,7 +1092,7 @@ pub fn stream_chat(provider: &Provider, args: &StreamArgs) -> Result<ChunkStream
             }
             let mut headers = provider.auth_headers(args.key);
             headers.extend(accept_sse());
-            let reader = open_stream(&url, &headers, &payload, request_timeout(args)?, 2)?;
+            let reader = open_adapter_stream(&url, &headers, &payload, args)?;
             Ok(chunk_stream(GEMINI, &provider.label, reader, args))
         }
         other => Err(AnyLLMError::api(
