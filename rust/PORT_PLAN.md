@@ -107,20 +107,23 @@ sandbox. Workers share their manager's sandbox with `--shared-sandbox`.
 
 Models:
 
-- Top and 3 leads: `codex` / `gpt-6.2-sol`, reasoning `high`.
-- 9 managers: `codex` / `gpt-6.2-astra`, reasoning `high`.
+- Top and 3 leads: `codex` / `gpt-6.1-terra`, reasoning `medium`.
+- 9 managers: `codex` / `gpt-6-luna`, reasoning `medium`.
 - 37 workers: `opencode` / `opencode/deepseek-v4.1-flash-free`, reasoning
   `medium`.
+
+If Codex returns a plan-limit error, stop the tree and report to the parent.
+Do not retry, and do not switch models without the parent's approval.
 
 Spawn examples (flags in any order; do not add unsupported flags):
 
 ```sh
-room-cli thread spawn --provider codex --model gpt-6.2-sol \
-  --reasoning-level high --title "Rust L1-A core" \
+room-cli thread spawn --provider codex --model gpt-6.1-terra \
+  --reasoning-level medium --title "Rust L1-A core" \
   --prompt-file rust/agents/l1-core.md
 
-room-cli thread spawn --provider codex --model gpt-6.2-astra \
-  --reasoning-level high --title "Rust A1 adapters" \
+room-cli thread spawn --provider codex --model gpt-6-luna \
+  --reasoning-level medium --title "Rust A1 adapters" \
   --prompt-file /tmp/a1.md
 
 room-cli thread spawn --provider opencode \
