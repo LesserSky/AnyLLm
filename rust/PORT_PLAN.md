@@ -17,6 +17,23 @@ Do not start the later structure refactor or the visual redesign.
 - The Python launchers stay in place until the top agent proves parity. Do not
   switch them.
 
+## Toolchain
+
+Every fresh sandbox starts without Rust. Install it once per sandbox before
+any cargo command:
+
+```sh
+if ! command -v cargo >/dev/null 2>&1; then
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+    sh -s -- -y --profile minimal --default-toolchain stable
+fi
+. "$HOME/.cargo/env"
+rustup component add rustfmt clippy
+```
+
+The top, each lead, and each manager must do this in its own sandbox. Workers
+share their manager's sandbox and use the toolchain installed there.
+
 ## Mission
 
 Port every remaining Python behavior to Rust, with the same user-visible text,
