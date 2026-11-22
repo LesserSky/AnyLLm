@@ -77,7 +77,10 @@ impl TargetSpec {
             None | Some(Value::Null) => None,
             Some(Value::String(text)) => Some(text.clone()),
             Some(_) => {
-                return Err(malformed(format!("Target {:?} has an invalid base URL.", name)))
+                return Err(malformed(format!(
+                    "Target {:?} has an invalid base URL.",
+                    name
+                )))
             }
         };
         Ok(TargetSpec {
@@ -244,7 +247,10 @@ pub fn add_target(
 ) -> Result<Target> {
     let alias = validate_target_alias(name, providers)?;
     if model.trim().is_empty() {
-        return Err(Error::config("A target needs a model name.", Some("Pass --model NAME.".to_string())));
+        return Err(Error::config(
+            "A target needs a model name.",
+            Some("Pass --model NAME.".to_string()),
+        ));
     }
     let provider = get_provider(provider, providers)?;
     let stored_url = match base_url {
@@ -405,9 +411,7 @@ fn alias_credential(alias: Option<&str>, store: &dyn KeyStore) -> (Option<String
         }
     }
     // Provider keys live under the bare provider name. Do not read that slot.
-    if let Ok(Some(saved)) =
-        target_store_name(&cleaned).and_then(|slot| store.get(&slot))
-    {
+    if let Ok(Some(saved)) = target_store_name(&cleaned).and_then(|slot| store.get(&slot)) {
         return (Some(saved), "saved-target".to_string());
     }
     (None, String::new())
@@ -429,7 +433,11 @@ pub fn resolve_credentials(
     }
     if host_is_default || custom_endpoint {
         let resolution = resolve_key(provider, store);
-        return (resolution.value, resolution.source, host_is_default || custom_endpoint);
+        return (
+            resolution.value,
+            resolution.source,
+            host_is_default || custom_endpoint,
+        );
     }
     // Named builtin (or a user provider) pointed at a different host.
     (None, "withheld".to_string(), false)
@@ -472,7 +480,15 @@ pub fn resolve_provider_model(
     require_credential: bool,
 ) -> Result<ResolvedTarget> {
     let (provider_name, model) = split_provider_model(spec)?;
-    resolve_spec(&provider_name, &model, None, None, providers, store, require_credential)
+    resolve_spec(
+        &provider_name,
+        &model,
+        None,
+        None,
+        providers,
+        store,
+        require_credential,
+    )
 }
 
 /// Resolve an alias, or a `provider:model` string. Never guess between them.
@@ -558,7 +574,11 @@ will not be sent there. Save a target key with `anyllm keys set {}` or set {}.",
         ));
     }
     Ok(ResolvedTarget {
-        host_is_default: if provider.base_url.trim().is_empty() { true } else { host_is_default },
+        host_is_default: if provider.base_url.trim().is_empty() {
+            true
+        } else {
+            host_is_default
+        },
         http_warning: plain_http_warning(&concrete),
         target,
         provider,
@@ -681,9 +701,7 @@ pub fn explicit_endpoint_applies(session: &Session) -> bool {
         return false;
     }
     match &session.explicit_endpoint {
-        Some(explicit) if !explicit.trim().is_empty() => {
-            urls_match(explicit, &session.base_url)
-        }
+        Some(explicit) if !explicit.trim().is_empty() => urls_match(explicit, &session.base_url),
         _ => false,
     }
 }
@@ -709,7 +727,11 @@ pub fn resolve_live_credential(
 
 /// One line for /info and /keys. Never includes the secret itself.
 /// Mirrors `targets.describe_live_key`.
-pub fn describe_live_key(session: &Session, providers: &ProviderMap, store: &dyn KeyStore) -> String {
+pub fn describe_live_key(
+    session: &Session,
+    providers: &ProviderMap,
+    store: &dyn KeyStore,
+) -> String {
     let (credential, source) = resolve_live_credential(session, providers, store);
     if !session.provider.key_required && credential.is_none() {
         return "not needed".to_string();
@@ -720,7 +742,10 @@ pub fn describe_live_key(session: &Session, providers: &ProviderMap, store: &dyn
     }
     let explicit = explicit_endpoint_applies(session);
     if explicit && source.starts_with("env:") {
-        return format!("explicit --base-url, environment ({})", source.split(':').nth(1).unwrap_or(""));
+        return format!(
+            "explicit --base-url, environment ({})",
+            source.split(':').nth(1).unwrap_or("")
+        );
     }
     if explicit && source == "saved" {
         return format!("explicit --base-url, saved ({})", mask_key(&credential));
@@ -771,17 +796,19 @@ pub fn rebind_session_credentials(
         return Ok(());
     }
     session.api_key = None;
-    session.key_source = if source.is_empty() { "withheld".to_string() } else { source };
+    session.key_source = if source.is_empty() {
+        "withheld".to_string()
+    } else {
+        source
+    };
     if explicit && session.provider.key_required {
         return Err(missing_endpoint_key(
             &session.provider,
-            Some(
-                if session.provider.base_url.trim().is_empty() {
-                    session.base_url.as_str()
-                } else {
-                    session.provider.base_url.as_str()
-                }
-            ),
+            Some(if session.provider.base_url.trim().is_empty() {
+                session.base_url.as_str()
+            } else {
+                session.provider.base_url.as_str()
+            }),
             None,
         ));
     }
@@ -858,7 +885,10 @@ pub fn render_target_list(style: &Style, providers: &ProviderMap) -> Result<Vec<
     lines.push(style.bold("NAME          PROVIDER/MODEL"));
     for (name, spec) in &specs {
         lines.push(format!("{:<12}  {}/{}", name, spec.provider, spec.model));
-        let url = spec.base_url.clone().unwrap_or_else(|| "(provider default)".to_string());
+        let url = spec
+            .base_url
+            .clone()
+            .unwrap_or_else(|| "(provider default)".to_string());
         lines.push(style.dim(&format!("              {}", url)));
     }
     Ok(lines)
@@ -917,8 +947,14 @@ pub fn repl_targets(repl: &mut dyn Repl, _rest: &str) -> Result<()> {
     }
     repl.say(&style.bold("Targets"));
     for (name, spec) in &specs {
-        let url = spec.base_url.clone().unwrap_or_else(|| "(provider default)".to_string());
-        repl.say(&format!("  {}  {}/{}  {}", name, spec.provider, spec.model, url));
+        let url = spec
+            .base_url
+            .clone()
+            .unwrap_or_else(|| "(provider default)".to_string());
+        repl.say(&format!(
+            "  {}  {}/{}  {}",
+            name, spec.provider, spec.model, url
+        ));
     }
     repl.say("");
     Ok(())
@@ -954,7 +990,8 @@ mod tests {
 
     impl TestHome {
         fn new(tag: &str) -> TestHome {
-            let dir = std::env::temp_dir().join(format!("orch-targets-{}-{}", tag, crate::sys::new_id()));
+            let dir =
+                std::env::temp_dir().join(format!("orch-targets-{}-{}", tag, crate::sys::new_id()));
             std::fs::create_dir_all(&dir).unwrap();
             TestHome(dir)
         }
@@ -982,14 +1019,24 @@ mod tests {
 
     #[test]
     fn roundtrip_and_remove() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let home = TestHome::new("roundtrip");
         set_home(&home);
         clear_keys_from_env();
         let providers = builtins();
         let store = EmptyKeyStore;
 
-        add_target("fast", "openscale", "deepseek/deepseek-v4.1-flash", None, &providers, &store).unwrap();
+        add_target(
+            "fast",
+            "openscale",
+            "deepseek/deepseek-v4.1-flash",
+            None,
+            &providers,
+            &store,
+        )
+        .unwrap();
         add_target(
             "dev",
             "custom",
@@ -1002,7 +1049,10 @@ mod tests {
         let specs = list_target_specs(&providers).unwrap();
         assert_eq!(specs["fast"].provider, "openscale");
         assert_eq!(specs["fast"].base_url, None);
-        assert_eq!(specs["dev"].base_url.as_deref(), Some("http://localhost:1234/v1"));
+        assert_eq!(
+            specs["dev"].base_url.as_deref(),
+            Some("http://localhost:1234/v1")
+        );
         let text = std::fs::read_to_string(targets_path()).unwrap();
         assert!(!text.contains("sk-"));
         assert!(!text.to_lowercase().contains("api_key"));
@@ -1021,7 +1071,9 @@ mod tests {
 
     #[test]
     fn unknown_alias_fails_before_a_request() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let home = TestHome::new("unknown");
         set_home(&home);
         clear_keys_from_env();
@@ -1040,7 +1092,9 @@ mod tests {
 
     #[test]
     fn malformed_and_future_version() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let home = TestHome::new("versions");
         set_home(&home);
         clear_keys_from_env();
@@ -1060,7 +1114,9 @@ mod tests {
 
     #[test]
     fn default_host_uses_provider_key_and_other_host_does_not() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let home = TestHome::new("hosts");
         set_home(&home);
         clear_keys_from_env();
@@ -1068,7 +1124,15 @@ mod tests {
         let providers = builtins();
         let store = EmptyKeyStore;
 
-        add_target("official", "openai", "gpt-4o-mini", None, &providers, &store).unwrap();
+        add_target(
+            "official",
+            "openai",
+            "gpt-4o-mini",
+            None,
+            &providers,
+            &store,
+        )
+        .unwrap();
         let official = resolve_named("official", &providers, &store, true).unwrap();
         assert_eq!(official.credential.as_deref(), Some("sk-openai-secret"));
         assert!(official.host_is_default);
@@ -1090,7 +1154,9 @@ mod tests {
 
     #[test]
     fn alias_key_is_sent_to_a_non_default_host() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let home = TestHome::new("aliaskey");
         set_home(&home);
         clear_keys_from_env();
@@ -1116,7 +1182,9 @@ mod tests {
 
     #[test]
     fn custom_endpoint_can_use_generic_key() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let home = TestHome::new("generic");
         set_home(&home);
         clear_keys_from_env();
@@ -1138,7 +1206,9 @@ mod tests {
 
     #[test]
     fn user_provider_key_is_not_forwarded_to_a_different_url() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let home = TestHome::new("labkey");
         set_home(&home);
         clear_keys_from_env();
@@ -1175,7 +1245,10 @@ mod tests {
             "https://api.openai.com:443/v1/".to_string(),
             "HTTPS://api.openai.com/v1".to_string(),
         ] {
-            assert_eq!(canonical_endpoint(&url).unwrap(), canonical_endpoint(&default).unwrap());
+            assert_eq!(
+                canonical_endpoint(&url).unwrap(),
+                canonical_endpoint(&default).unwrap()
+            );
             assert!(host_uses_provider_key(openai, Some(&url)));
             assert!(explicit_override_warning(openai, Some(&url)).is_none());
         }
@@ -1187,21 +1260,28 @@ mod tests {
             "https://proxy.example/v1",
             "https://user:secret@api.openai.com/v1",
         ] {
-            assert_ne!(canonical_endpoint(url).unwrap(), canonical_endpoint(&default).unwrap());
+            assert_ne!(
+                canonical_endpoint(url).unwrap(),
+                canonical_endpoint(&default).unwrap()
+            );
             assert!(!host_uses_provider_key(openai, Some(url)));
             let note = explicit_override_warning(openai, Some(url)).unwrap();
             assert!(note.contains("still sends the openai key"));
             assert!(!note.contains('\n'));
             assert!(!note.contains("sk-"));
         }
-        let remote_http = explicit_override_warning(openai, Some("http://proxy.example/v1")).unwrap();
+        let remote_http =
+            explicit_override_warning(openai, Some("http://proxy.example/v1")).unwrap();
         assert!(remote_http.contains("not encrypted"));
         let local_http = explicit_override_warning(openai, Some("http://127.0.0.1:9/v1")).unwrap();
         assert!(local_http.contains("still sends the openai key"));
         assert!(!local_http.contains("not encrypted"));
         let custom = &providers["custom"];
         assert!(explicit_override_warning(custom, Some("https://other.example/v1")).is_none());
-        assert!(host_uses_provider_key(custom, Some("http://proxy.example/v1?q=1")));
+        assert!(host_uses_provider_key(
+            custom,
+            Some("http://proxy.example/v1?q=1")
+        ));
     }
 
     #[test]
@@ -1215,11 +1295,18 @@ mod tests {
 
     #[test]
     fn alias_cannot_reuse_a_provider_name_or_env_slug() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let home = TestHome::new("collide");
         set_home(&home);
         clear_keys_from_env();
-        let mut lab = Provider::new("open.scale", "Open Scale", crate::sys::OPENAI, "https://open.scale.example/v1");
+        let mut lab = Provider::new(
+            "open.scale",
+            "Open Scale",
+            crate::sys::OPENAI,
+            "https://open.scale.example/v1",
+        );
         lab.env_vars.push("OPEN_SCALE_API_KEY".to_string());
         let mut providers = builtins();
         providers.insert("open.scale".to_string(), lab);
@@ -1234,14 +1321,26 @@ mod tests {
         let _ = store;
 
         for name in ["openscale", "OpenScale", "OPENSCALE"] {
-            let error = add_target(name, "openscale", "m", Some("http://127.0.0.1:9/v1"), &providers, &EmptyKeyStore)
-                .unwrap_err();
+            let error = add_target(
+                name,
+                "openscale",
+                "m",
+                Some("http://127.0.0.1:9/v1"),
+                &providers,
+                &EmptyKeyStore,
+            )
+            .unwrap_err();
             assert!(error.message.to_lowercase().contains("collides"));
         }
-        assert!(
-            add_target("open-scale", "openai", "m", Some("http://127.0.0.1:9/v1"), &providers, &EmptyKeyStore)
-                .is_err()
-        );
+        assert!(add_target(
+            "open-scale",
+            "openai",
+            "m",
+            Some("http://127.0.0.1:9/v1"),
+            &providers,
+            &EmptyKeyStore
+        )
+        .is_err());
 
         // A target alias never receives the provider's own key.
         std::env::set_var("OPENSCALE_API_KEY", "provider-sentinel");
@@ -1258,7 +1357,9 @@ mod tests {
 
     #[test]
     fn describe_live_key_and_rebind_rules() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let home = TestHome::new("live");
         set_home(&home);
         clear_keys_from_env();
@@ -1272,7 +1373,10 @@ mod tests {
         session.explicit_endpoint = Some("http://elsewhere.example/v1".to_string());
         session.base_url = "http://elsewhere.example/v1".to_string();
         let described = describe_live_key(&session, &providers, &EmptyKeyStore);
-        assert_eq!(described, "explicit --base-url, environment (OPENAI_API_KEY)");
+        assert_eq!(
+            described,
+            "explicit --base-url, environment (OPENAI_API_KEY)"
+        );
         rebind_session_credentials(&mut session, &providers, &EmptyKeyStore).unwrap();
         assert_eq!(session.api_key.as_deref(), Some("sk-openai-secret"));
         std::env::remove_var("OPENAI_API_KEY");

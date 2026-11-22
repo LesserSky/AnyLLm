@@ -1,0 +1,13 @@
+[package]
+name = "anyllm-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "anyllm"
+path = "src/main.rs"
+
+[dependencies]
+anyllm-core = { path = "../core" }
+anyllm-orch = { path = "../orch" }
+serde_json = "1"

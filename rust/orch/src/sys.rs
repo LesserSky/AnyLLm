@@ -46,7 +46,14 @@ pub struct Error {
 
 impl Error {
     fn new(kind: ErrorKind, message: impl Into<String>, hint: Option<String>) -> Error {
-        Error { kind, message: message.into(), hint, status: None, param: None, code: None }
+        Error {
+            kind,
+            message: message.into(),
+            hint,
+            status: None,
+            param: None,
+            code: None,
+        }
     }
 
     pub fn usage(message: impl Into<String>, hint: Option<String>) -> Error {
@@ -88,7 +95,10 @@ impl Error {
     /// Errors rendered as warnings (yellow) rather than failures (red),
     /// matching `_WARN_ERRORS` in `term.py`.
     pub fn is_warn(&self) -> bool {
-        matches!(self.kind, ErrorKind::RateLimit | ErrorKind::Network | ErrorKind::Usage)
+        matches!(
+            self.kind,
+            ErrorKind::RateLimit | ErrorKind::Network | ErrorKind::Usage
+        )
     }
 }
 
@@ -177,97 +187,177 @@ pub fn builtins() -> BTreeMap<String, Provider> {
     let mut map = BTreeMap::new();
     let entries = [
         provider(
-            "openai", "OpenAI", OPENAI, "https://api.openai.com/v1",
+            "openai",
+            "OpenAI",
+            OPENAI,
+            "https://api.openai.com/v1",
             &["OPENAI_API_KEY"],
             &["gpt-4o-mini", "gpt-4o", "gpt-4.1-mini"],
-            true, false, "https://platform.openai.com/docs",
-            "Authorization", "Bearer ",
+            true,
+            false,
+            "https://platform.openai.com/docs",
+            "Authorization",
+            "Bearer ",
         ),
         provider(
-            "anthropic", "Anthropic Claude", ANTHROPIC, "https://api.anthropic.com/v1",
+            "anthropic",
+            "Anthropic Claude",
+            ANTHROPIC,
+            "https://api.anthropic.com/v1",
             &["ANTHROPIC_API_KEY"],
             &["claude-sonnet-4-5", "claude-haiku-4-5", "claude-opus-4-1"],
-            true, false, "https://docs.anthropic.com",
-            "x-api-key", "",
+            true,
+            false,
+            "https://docs.anthropic.com",
+            "x-api-key",
+            "",
         ),
         provider(
-            "google", "Google Gemini", GEMINI, "https://generativelanguage.googleapis.com/v1beta",
+            "google",
+            "Google Gemini",
+            GEMINI,
+            "https://generativelanguage.googleapis.com/v1beta",
             &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
             &["gemini-2.5-flash", "gemini-2.5-pro"],
-            true, false, "https://ai.google.dev/gemini-api/docs",
-            "x-goog-api-key", "",
+            true,
+            false,
+            "https://ai.google.dev/gemini-api/docs",
+            "x-goog-api-key",
+            "",
         ),
         provider(
-            "deepseek", "DeepSeek", OPENAI, "https://api.deepseek.com/v1",
+            "deepseek",
+            "DeepSeek",
+            OPENAI,
+            "https://api.deepseek.com/v1",
             &["DEEPSEEK_API_KEY"],
             &["deepseek-chat", "deepseek-reasoner"],
-            true, false, "https://api-docs.deepseek.com",
-            "Authorization", "Bearer ",
+            true,
+            false,
+            "https://api-docs.deepseek.com",
+            "Authorization",
+            "Bearer ",
         ),
         provider(
-            "groq", "Groq", OPENAI, "https://api.groq.com/openai/v1",
+            "groq",
+            "Groq",
+            OPENAI,
+            "https://api.groq.com/openai/v1",
             &["GROQ_API_KEY"],
             &["llama-3.3-70b-versatile"],
-            true, false, "https://console.groq.com/docs",
-            "Authorization", "Bearer ",
+            true,
+            false,
+            "https://console.groq.com/docs",
+            "Authorization",
+            "Bearer ",
         ),
         provider(
-            "mistral", "Mistral", OPENAI, "https://api.mistral.ai/v1",
+            "mistral",
+            "Mistral",
+            OPENAI,
+            "https://api.mistral.ai/v1",
             &["MISTRAL_API_KEY"],
             &["mistral-large-latest", "mistral-small-latest"],
-            true, false, "https://docs.mistral.ai",
-            "Authorization", "Bearer ",
+            true,
+            false,
+            "https://docs.mistral.ai",
+            "Authorization",
+            "Bearer ",
         ),
         provider(
-            "xai", "xAI Grok", OPENAI, "https://api.x.ai/v1",
+            "xai",
+            "xAI Grok",
+            OPENAI,
+            "https://api.x.ai/v1",
             &["XAI_API_KEY"],
             &["grok-3", "grok-3-mini"],
-            true, false, "https://docs.x.ai",
-            "Authorization", "Bearer ",
+            true,
+            false,
+            "https://docs.x.ai",
+            "Authorization",
+            "Bearer ",
         ),
         provider(
-            "openrouter", "OpenRouter", OPENAI, "https://openrouter.ai/api/v1",
+            "openrouter",
+            "OpenRouter",
+            OPENAI,
+            "https://openrouter.ai/api/v1",
             &["OPENROUTER_API_KEY"],
             &["openrouter/auto"],
-            true, false, "https://openrouter.ai/docs",
-            "Authorization", "Bearer ",
+            true,
+            false,
+            "https://openrouter.ai/docs",
+            "Authorization",
+            "Bearer ",
         ),
         provider(
-            "openscale", "OpenScale", OPENAI, "https://api.openscale.so/v1",
+            "openscale",
+            "OpenScale",
+            OPENAI,
+            "https://api.openscale.so/v1",
             &["OPENSCALE_API_KEY"],
             &[
                 "deepseek/deepseek-v4.1-flash",
                 "z-ai/glm-5.3-flash",
                 "deepseek/deepseek-v4.1-flash:fast",
             ],
-            true, false, "https://openscale.so/docs",
-            "Authorization", "Bearer ",
+            true,
+            false,
+            "https://openscale.so/docs",
+            "Authorization",
+            "Bearer ",
         ),
         provider(
-            "together", "Together AI", OPENAI, "https://api.together.xyz/v1",
+            "together",
+            "Together AI",
+            OPENAI,
+            "https://api.together.xyz/v1",
             &["TOGETHER_API_KEY"],
             &["meta-llama/Llama-3.3-70B-Instruct-Turbo"],
-            true, false, "https://docs.together.ai",
-            "Authorization", "Bearer ",
+            true,
+            false,
+            "https://docs.together.ai",
+            "Authorization",
+            "Bearer ",
         ),
         provider(
-            "ollama", "Ollama (local)", OPENAI, "http://127.0.0.1:11434/v1",
-            &[], &["llama3.2"],
-            false, true,
+            "ollama",
+            "Ollama (local)",
+            OPENAI,
+            "http://127.0.0.1:11434/v1",
+            &[],
+            &["llama3.2"],
+            false,
+            true,
             "https://github.com/ollama/ollama/blob/main/docs/openai.md",
-            "Authorization", "Bearer ",
+            "Authorization",
+            "Bearer ",
         ),
         provider(
-            "lmstudio", "LM Studio (local)", OPENAI, "http://127.0.0.1:1234/v1",
-            &[], &[],
-            false, true, "https://lmstudio.ai/docs",
-            "Authorization", "Bearer ",
+            "lmstudio",
+            "LM Studio (local)",
+            OPENAI,
+            "http://127.0.0.1:1234/v1",
+            &[],
+            &[],
+            false,
+            true,
+            "https://lmstudio.ai/docs",
+            "Authorization",
+            "Bearer ",
         ),
         provider(
-            "custom", "Custom OpenAI-compatible endpoint", OPENAI, "",
-            &["ANYLLM_API_KEY"], &[],
-            true, false, "",
-            "Authorization", "Bearer ",
+            "custom",
+            "Custom OpenAI-compatible endpoint",
+            OPENAI,
+            "",
+            &["ANYLLM_API_KEY"],
+            &[],
+            true,
+            false,
+            "",
+            "Authorization",
+            "Bearer ",
         ),
     ];
     for entry in entries {
@@ -317,7 +407,12 @@ pub fn urlsplit(url: &str) -> UrlParts {
     let value = url.trim();
     let (scheme, rest) = match value.find("://") {
         Some(index) => (value[..index].to_string(), &value[index + 3..]),
-        None => return UrlParts { path: value.to_string(), ..Default::default() },
+        None => {
+            return UrlParts {
+                path: value.to_string(),
+                ..Default::default()
+            }
+        }
     };
     parts.scheme = scheme.to_lowercase();
     let (authority, tail) = match rest.find(['/', '?', '#']) {
@@ -341,7 +436,10 @@ pub fn urlsplit(url: &str) -> UrlParts {
         }
     }
     let (host, port) = match hostport.rfind(':') {
-        Some(index) if !hostport.starts_with('[') || hostport[index + 1..].chars().all(|c| c.is_ascii_digit()) => {
+        Some(index)
+            if !hostport.starts_with('[')
+                || hostport[index + 1..].chars().all(|c| c.is_ascii_digit()) =>
+        {
             let port_text = &hostport[index + 1..];
             let port = port_text.parse::<u16>().ok();
             if port.is_some() {
@@ -352,7 +450,10 @@ pub fn urlsplit(url: &str) -> UrlParts {
         }
         _ => (hostport, None),
     };
-    parts.host = host.trim_start_matches('[').trim_end_matches(']').to_string();
+    parts.host = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_string();
     parts.port = port;
     let mut tail_text = tail;
     if let Some(hash) = tail_text.find('#') {
@@ -379,7 +480,10 @@ pub fn validate_base_url(url: &str) -> Result<String> {
     if (parts.scheme != "http" && parts.scheme != "https") || parts.netloc.is_empty() {
         return Err(Error::config(
             format!("Invalid base URL {:?}.", url),
-            Some("Use an http:// or https:// URL, for example https://api.example.com/v1".to_string()),
+            Some(
+                "Use an http:// or https:// URL, for example https://api.example.com/v1"
+                    .to_string(),
+            ),
         ));
     }
     Ok(value)
@@ -451,7 +555,9 @@ impl Usage {
         let int = |key: &str| -> Option<i64> {
             match raw.get(key) {
                 Some(serde_json::Value::Number(number)) => number.as_i64(),
-                Some(serde_json::Value::String(text)) if !text.is_empty() && text.chars().all(|c| c.is_ascii_digit()) => {
+                Some(serde_json::Value::String(text))
+                    if !text.is_empty() && text.chars().all(|c| c.is_ascii_digit()) =>
+                {
                     text.parse::<i64>().ok()
                 }
                 _ => None,
@@ -505,7 +611,12 @@ pub struct Message {
 
 impl Message {
     pub fn new(role: &str, content: &str) -> Message {
-        Message { role: role.to_string(), content: content.to_string(), tool_calls: None, tool_call_id: None }
+        Message {
+            role: role.to_string(),
+            content: content.to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+        }
     }
 }
 
@@ -593,7 +704,8 @@ impl Session {
             return Err(Error::usage("The answer is empty.", None));
         }
         self.messages.push(Message::new("user", user_text));
-        self.messages.push(Message::new("assistant", assistant_text));
+        self.messages
+            .push(Message::new("assistant", assistant_text));
         if let Some(usage) = usage {
             self.usage = self.usage.combined(usage);
         }
@@ -629,7 +741,10 @@ pub struct KeyResolution {
 
 impl KeyResolution {
     pub fn present(&self) -> bool {
-        self.value.as_deref().map(|value| !value.is_empty()).unwrap_or(false)
+        self.value
+            .as_deref()
+            .map(|value| !value.is_empty())
+            .unwrap_or(false)
     }
 
     pub fn display(&self) -> String {
@@ -655,7 +770,11 @@ pub fn mask_key(value: &str) -> String {
     if chars.len() <= 8 {
         return "*".repeat(chars.len());
     }
-    format!("{}...{}", value[..4].to_string(), value[value.len() - 4..].to_string())
+    format!(
+        "{}...{}",
+        value[..4].to_string(),
+        value[value.len() - 4..].to_string()
+    )
 }
 
 pub fn env_slug(name: &str) -> String {
@@ -714,12 +833,27 @@ pub fn resolve_key(provider: &Provider, store: &dyn KeyStore) -> KeyResolution {
         }
     }
     if let Ok(Some(stored)) = store.get(&provider.name) {
-        return KeyResolution { value: Some(stored), source: "saved".to_string(), env_var: None, stored: true };
+        return KeyResolution {
+            value: Some(stored),
+            source: "saved".to_string(),
+            env_var: None,
+            stored: true,
+        };
     }
     if !provider.key_required {
-        return KeyResolution { value: None, source: "not required".to_string(), env_var: None, stored: false };
+        return KeyResolution {
+            value: None,
+            source: "not required".to_string(),
+            env_var: None,
+            stored: false,
+        };
     }
-    KeyResolution { value: None, source: "missing".to_string(), env_var: None, stored: false }
+    KeyResolution {
+        value: None,
+        source: "missing".to_string(),
+        env_var: None,
+        stored: false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -924,7 +1058,10 @@ mod tests {
 
     #[test]
     fn validate_base_url_matches_python() {
-        assert_eq!(validate_base_url(" https://api.example.com/v1/ ").unwrap(), "https://api.example.com/v1");
+        assert_eq!(
+            validate_base_url(" https://api.example.com/v1/ ").unwrap(),
+            "https://api.example.com/v1"
+        );
         assert!(validate_base_url("").is_err());
         assert!(validate_base_url("ftp://example.com").is_err());
         assert!(validate_base_url("https://").is_err());
@@ -945,7 +1082,10 @@ mod tests {
 
     #[test]
     fn split_words_quoting() {
-        assert_eq!(split_words("a 'b c' \"d\\\"e\"").unwrap(), vec!["a", "b c", "d\"e"]);
+        assert_eq!(
+            split_words("a 'b c' \"d\\\"e\"").unwrap(),
+            vec!["a", "b c", "d\"e"]
+        );
         assert!(split_words("'unclosed").is_err());
         assert!(split_words("").unwrap().is_empty());
     }
@@ -961,19 +1101,35 @@ mod tests {
 
     #[test]
     fn usage_update_keeps_max_and_combined_adds() {
-        let mut base = Usage { input_tokens: Some(10), ..Default::default() };
-        base.update(&Usage { input_tokens: Some(5), output_tokens: Some(3), ..Default::default() });
+        let mut base = Usage {
+            input_tokens: Some(10),
+            ..Default::default()
+        };
+        base.update(&Usage {
+            input_tokens: Some(5),
+            output_tokens: Some(3),
+            ..Default::default()
+        });
         assert_eq!(base.input_tokens, Some(10));
         assert_eq!(base.output_tokens, Some(3));
-        let sum = base.combined(&Usage { input_tokens: Some(2), ..Default::default() });
+        let sum = base.combined(&Usage {
+            input_tokens: Some(2),
+            ..Default::default()
+        });
         assert_eq!(sum.input_tokens, Some(12));
     }
 
     #[test]
     fn append_exchange_updates_turns_and_usage() {
         let mut session = Session::new(builtins()["openai"].clone(), "gpt-4o-mini");
-        let usage = Usage { input_tokens: Some(3), output_tokens: Some(2), ..Default::default() };
-        session.append_exchange("hi", "hello", Some(&usage)).unwrap();
+        let usage = Usage {
+            input_tokens: Some(3),
+            output_tokens: Some(2),
+            ..Default::default()
+        };
+        session
+            .append_exchange("hi", "hello", Some(&usage))
+            .unwrap();
         assert_eq!(session.turns, 1);
         assert_eq!(session.usage.input_tokens, Some(3));
         assert!(session.append_exchange(" ", "x", None).is_err());
@@ -986,6 +1142,8 @@ mod tests {
         let mut lab = Provider::new("lab", "Lab", OPENAI, "http://lab.internal/v1");
         lab.env_vars.push("LAB_API_KEY".to_string());
         assert!(accepts_generic_api_key(&lab));
-        assert!(!accepts_generic_api_key(&Provider::new("a", "A", ANTHROPIC, "u")));
+        assert!(!accepts_generic_api_key(&Provider::new(
+            "a", "A", ANTHROPIC, "u"
+        )));
     }
 }

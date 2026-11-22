@@ -8,15 +8,13 @@ use std::sync::Mutex;
 
 use serde_json::{json, Value};
 
-use anyllm_orch::budgets::{self, Budget, PlannedCall, estimate_cost, preflight, receipt};
+use anyllm_orch::budgets::{self, estimate_cost, preflight, receipt, Budget, PlannedCall};
 use anyllm_orch::decimal::Decimal;
 use anyllm_orch::seam::{
-    self, ApprovedAttachment, RunCall, RunOptions, load_feature, make_snapshot, run_request,
-    save_feature,
+    self, load_feature, make_snapshot, run_request, save_feature, ApprovedAttachment, RunCall,
+    RunOptions,
 };
-use anyllm_orch::sys::{
-    builtins, Chunk, EmptyKeyStore, Error, KeyStore, Message, Provider, Usage,
-};
+use anyllm_orch::sys::{builtins, Chunk, EmptyKeyStore, Error, KeyStore, Message, Provider, Usage};
 use anyllm_orch::targets::{self, Target};
 
 // One process-wide lock: these tests redirect ANYLLM_HOME and set key env
@@ -27,11 +25,8 @@ struct TestHome(std::path::PathBuf);
 
 impl TestHome {
     fn new(tag: &str) -> TestHome {
-        let dir = std::env::temp_dir().join(format!(
-            "orch-it-{}-{}",
-            tag,
-            anyllm_orch::sys::new_id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("orch-it-{}-{}", tag, anyllm_orch::sys::new_id()));
         std::fs::create_dir_all(&dir).unwrap();
         TestHome(dir)
     }
@@ -80,14 +75,18 @@ impl anyllm_orch::sys::ChatBackend for FakeBackend {
 
 #[test]
 fn target_resolution_gates_credentials_by_host() {
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let home = TestHome::new("resolve");
     std::env::set_var("ANYLLM_HOME", &home.0);
     clear_key_env();
 
     let providers = builtins();
     let mut store = MapStore(BTreeMap::new());
-    store.0.insert("target:lab".to_string(), "target-secret".to_string());
+    store
+        .0
+        .insert("target:lab".to_string(), "target-secret".to_string());
 
     // Saved target on the provider's own host: provider env key is used.
     std::env::set_var("OPENAI_API_KEY", "sk-openai-secret");
@@ -140,7 +139,9 @@ fn target_resolution_gates_credentials_by_host() {
 
 #[test]
 fn budget_preflight_and_receipt_compose() {
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let home = TestHome::new("budget");
     std::env::set_var("ANYLLM_HOME", &home.0);
     clear_key_env();
@@ -170,7 +171,10 @@ fn budget_preflight_and_receipt_compose() {
     let report = preflight(
         &calls,
         &prices,
-        &Budget { estimated_usd: Some(Decimal::parse("10").unwrap()), ..Budget::new() },
+        &Budget {
+            estimated_usd: Some(Decimal::parse("10").unwrap()),
+            ..Budget::new()
+        },
         None,
     );
     assert!(!report.allowed);
@@ -191,7 +195,10 @@ fn budget_preflight_and_receipt_compose() {
     let allowed = preflight(
         &calls,
         &prices,
-        &Budget { estimated_usd: Some(Decimal::parse("2").unwrap()), ..Budget::new() },
+        &Budget {
+            estimated_usd: Some(Decimal::parse("2").unwrap()),
+            ..Budget::new()
+        },
         None,
     );
     assert!(allowed.allowed);
@@ -214,7 +221,9 @@ fn budget_preflight_and_receipt_compose() {
 
 #[test]
 fn seam_run_request_and_feature_files() {
-    let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let home = TestHome::new("seam");
     std::env::set_var("ANYLLM_HOME", &home.0);
     clear_key_env();
@@ -222,13 +231,26 @@ fn seam_run_request_and_feature_files() {
     // run_request against a scripted backend: status derives the same way.
     let backend = FakeBackend {
         chunks: vec![
-            Chunk { text: "Hel".into(), ..Default::default() },
-            Chunk { text: "lo".into(), ..Default::default() },
             Chunk {
-                usage: Some(Usage { input_tokens: Some(7), output_tokens: Some(4), ..Default::default() }),
+                text: "Hel".into(),
                 ..Default::default()
             },
-            Chunk { finish_reason: Some("stop".into()), ..Default::default() },
+            Chunk {
+                text: "lo".into(),
+                ..Default::default()
+            },
+            Chunk {
+                usage: Some(Usage {
+                    input_tokens: Some(7),
+                    output_tokens: Some(4),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            Chunk {
+                finish_reason: Some("stop".into()),
+                ..Default::default()
+            },
         ],
     };
     let provider = Provider::new("mock", "Mock", "openai", "http://127.0.0.1/v1");
@@ -238,7 +260,11 @@ fn seam_run_request_and_feature_files() {
         None,
         None,
         None,
-        Some(vec![ApprovedAttachment::new("notes.txt", "abc", "hello-notes")]),
+        Some(vec![ApprovedAttachment::new(
+            "notes.txt",
+            "abc",
+            "hello-notes",
+        )]),
         false,
         None,
     );
