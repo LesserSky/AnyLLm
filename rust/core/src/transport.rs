@@ -4,7 +4,11 @@
 //! response body incrementally via `response.into_reader()`.
 
 use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 
 use serde_json::{Map, Value};
 
@@ -173,7 +177,10 @@ fn parse_error_body(body: &[u8]) -> (String, Option<String>, Option<String>) {
                 .or_else(|| detail.get("type"));
             if let Some(raw) = raw {
                 if !raw.is_null() {
-                    message = raw.to_string();
+                    message = raw
+                        .as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| raw.to_string());
                 }
             }
         }
@@ -335,10 +342,115 @@ fn failed_before_send(message: &str) -> bool {
         || lowered.contains("unreachable")
 }
 
+fn is_tls_failure(message: &str) -> bool {
+    let lowered = message.to_lowercase();
+    ["tls", "ssl", "certificate", "invalid peer cert"]
+        .iter()
+        .any(|marker| lowered.contains(marker))
+}
+
 fn network_error(message: &str, url: &str) -> AnyLLMError {
     let host = netloc_of(url);
-    AnyLLMError::network(format!("could not reach {}: {}", host, message))
-        .with_hint("Check your internet connection, proxy settings, and the base URL.")
+    let hint = if is_tls_failure(message) {
+        "TLS failed. Check your system certificates, proxy, or VPN."
+    } else {
+        "Check your internet connection, proxy settings, and the base URL."
+    };
+    AnyLLMError::network(format!("could not reach {}: {}", host, message)).with_hint(hint)
+}
+
+#[derive(Clone)]
+struct RequestControl {
+    deadline: Option<Instant>,
+    cancelled: Option<Arc<AtomicBool>>,
+}
+
+fn request_stopped(control: &RequestControl, url: &str) -> Option<AnyLLMError> {
+    if control
+        .cancelled
+        .as_ref()
+        .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    {
+        return Some(local_open_stop_error(
+            "Streaming request stopped locally after a cancel. The provider request may have started.",
+            url,
+        ));
+    }
+    if control
+        .deadline
+        .is_some_and(|deadline| Instant::now() >= deadline)
+    {
+        return Some(local_open_stop_error(
+            "The overall deadline elapsed while opening the streaming request. The provider request may have started.",
+            url,
+        ));
+    }
+    None
+}
+
+fn local_open_stop_error(message: &str, url: &str) -> AnyLLMError {
+    AnyLLMError::network(format!("{} ({})", message, netloc_of(url))).with_hint(
+        "The provider may still be generating and may still charge for this request. Stopping locally does not cancel it on the server.",
+    )
+}
+
+fn attempt_timeout(timeout: f64, control: Option<&RequestControl>, url: &str) -> Result<f64> {
+    let Some(control) = control else {
+        return Ok(timeout.max(0.1));
+    };
+    if let Some(error) = request_stopped(control, url) {
+        return Err(error);
+    }
+    let remaining = control.deadline.map(|deadline| {
+        deadline
+            .saturating_duration_since(Instant::now())
+            .as_secs_f64()
+    });
+    Ok(remaining
+        .map_or(timeout, |remaining| timeout.min(remaining))
+        .max(0.001))
+}
+
+fn wait_before_retry(delay: f64, control: Option<&RequestControl>, url: &str) -> Result<()> {
+    let Some(control) = control else {
+        std::thread::sleep(Duration::from_secs_f64(delay));
+        return Ok(());
+    };
+    let until = Instant::now() + Duration::from_secs_f64(delay);
+    loop {
+        if let Some(error) = request_stopped(control, url) {
+            return Err(error);
+        }
+        let remaining = until.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(20)));
+    }
+}
+
+fn read_status_body(
+    response: ureq::Response,
+    control: Option<&RequestControl>,
+    url: &str,
+) -> Result<Vec<u8>> {
+    let mut reader = response.into_reader();
+    let mut body = Vec::new();
+    let Some(control) = control else {
+        let _ = reader.read_to_end(&mut body);
+        return Ok(body);
+    };
+    let mut chunk = [0; 8192];
+    loop {
+        if let Some(error) = request_stopped(control, url) {
+            return Err(error);
+        }
+        match reader.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(read) => body.extend_from_slice(&chunk[..read]),
+        }
+    }
+    Ok(body)
 }
 
 /// Open a URL, retrying only failures that are safe to send again.
@@ -351,11 +463,42 @@ fn open(
     retries: usize,
     replay_safe: bool,
 ) -> Result<Box<dyn Read + Send + Sync>> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs_f64(timeout.max(0.1)))
-        .build();
+    open_with_control(
+        method,
+        url,
+        data,
+        headers,
+        timeout,
+        retries,
+        replay_safe,
+        None,
+    )
+}
+
+fn open_with_control(
+    method: &str,
+    url: &str,
+    data: Option<&Vec<u8>>,
+    headers: &[(String, String)],
+    timeout: f64,
+    retries: usize,
+    replay_safe: bool,
+    control: Option<&RequestControl>,
+) -> Result<Box<dyn Read + Send + Sync>> {
     let mut attempt = 0;
     loop {
+        if let Some(control) = control {
+            if let Some(error) = request_stopped(control, url) {
+                return Err(error);
+            }
+        }
+        let timeout = attempt_timeout(timeout, control, url)?;
+        let timeout = Duration::from_secs_f64(timeout);
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(timeout)
+            .timeout_read(timeout)
+            .timeout_write(timeout)
+            .build();
         let mut request = agent
             .request(method, url)
             .set("User-Agent", &user_agent())
@@ -369,16 +512,19 @@ fn open(
         };
         match outcome {
             Ok(response) => {
+                if let Some(control) = control {
+                    if let Some(error) = request_stopped(control, url) {
+                        return Err(error);
+                    }
+                }
                 return Ok(response.into_reader());
             }
             Err(ureq::Error::Status(status, response)) => {
                 let retry_after = response.header("Retry-After").map(str::to_string);
-                let mut body = Vec::new();
-                let reader = response.into_reader();
-                let _ = reader.take(100_000).read_to_end(&mut body);
+                let body = read_status_body(response, control, url)?;
                 if attempt < retries && should_retry_status(status, replay_safe) {
                     if let Some(delay) = retry_delay(retry_after.as_deref(), attempt) {
-                        std::thread::sleep(Duration::from_secs_f64(delay));
+                        wait_before_retry(delay, control, url)?;
                         attempt += 1;
                         continue;
                     }
@@ -387,8 +533,16 @@ fn open(
             }
             Err(ureq::Error::Transport(transport)) => {
                 let text = transport.to_string();
-                if attempt < retries && (replay_safe || failed_before_send(&text)) {
-                    std::thread::sleep(Duration::from_secs_f64(0.6 * (attempt as f64 + 1.0)));
+                if let Some(control) = control {
+                    if let Some(error) = request_stopped(control, url) {
+                        return Err(error);
+                    }
+                }
+                if attempt < retries
+                    && !is_tls_failure(&text)
+                    && (replay_safe || failed_before_send(&text))
+                {
+                    wait_before_retry(0.6 * (attempt as f64 + 1.0), control, url)?;
                     attempt += 1;
                     continue;
                 }
@@ -418,6 +572,39 @@ pub fn open_stream(
     Ok(reader)
 }
 
+/// POST JSON and return a streaming response while observing local controls.
+///
+/// Deadline checks are applied before every attempt and retry, and the
+/// remaining time bounds connection, read, and write operations. Cancellation
+/// is checked before and after each blocking request operation and every 20ms
+/// during retry waits. A blocking HTTP operation itself cannot be interrupted
+/// through `ureq`, so cancellation may be delayed by that operation's timeout.
+pub fn open_stream_controlled(
+    url: &str,
+    headers: &[(String, String)],
+    payload: &Value,
+    timeout: f64,
+    retries: usize,
+    deadline: Option<Instant>,
+    cancelled: Option<Arc<AtomicBool>>,
+) -> Result<Box<dyn Read + Send + Sync>> {
+    let data = serialize_payload(payload);
+    let control = RequestControl {
+        deadline,
+        cancelled,
+    };
+    open_with_control(
+        "POST",
+        url,
+        Some(&data),
+        headers,
+        timeout,
+        retries,
+        false,
+        Some(&control),
+    )
+}
+
 /// Perform a request and decode a JSON object or array.
 pub fn request_json(
     url: &str,
@@ -429,7 +616,7 @@ pub fn request_json(
 ) -> Result<Value> {
     let data = payload.map(serialize_payload);
     let replay_safe = matches!(method.to_uppercase().as_str(), "GET" | "HEAD" | "OPTIONS");
-    let reader = open(
+    let mut reader = open(
         method,
         url,
         data.as_ref(),
@@ -439,7 +626,7 @@ pub fn request_json(
         replay_safe,
     )?;
     let mut raw = Vec::new();
-    reader.take(10_000_000).read_to_end(&mut raw).map_err(|e| {
+    reader.read_to_end(&mut raw).map_err(|e| {
         AnyLLMError::network(format!(
             "connection broke while reading from {}: {}",
             netloc_of(url),
@@ -541,20 +728,25 @@ impl<R: Read> SseReader<R> {
     }
 }
 
-/// Find the next `\n\n` or `\r\n\r\n` boundary. Returns (block_len, next_pos).
+/// Find the next SSE blank-line boundary, including mixed LF/CRLF endings.
+/// Returns (block_len, next_pos).
 fn find_boundary(buf: &[u8]) -> Option<(usize, usize)> {
     let mut i = 0;
     while i + 1 < buf.len() {
-        if buf[i] == b'\n' && buf[i + 1] == b'\n' {
-            return Some((i, i + 2));
-        }
-        if buf[i] == b'\r'
-            && buf[i + 1] == b'\n'
-            && i + 3 < buf.len()
-            && buf[i + 2] == b'\r'
-            && buf[i + 3] == b'\n'
-        {
-            return Some((i, i + 4));
+        if buf[i] == b'\n' {
+            if buf[i + 1] == b'\n' {
+                return Some((i, i + 2));
+            }
+            if buf[i + 1] == b'\r' && buf.get(i + 2) == Some(&b'\n') {
+                return Some((i, i + 3));
+            }
+        } else if buf[i] == b'\r' && buf.get(i + 1) == Some(&b'\n') {
+            if buf.get(i + 2) == Some(&b'\n') {
+                return Some((i, i + 3));
+            }
+            if buf.get(i + 2) == Some(&b'\r') && buf.get(i + 3) == Some(&b'\n') {
+                return Some((i, i + 4));
+            }
         }
         i += 1;
     }
@@ -586,6 +778,133 @@ pub fn iter_sse<R: Read>(reader: R) -> SseIterator<R> {
         reader: SseReader::new(reader),
         finished: false,
     }
+}
+
+/// Iterate SSE events while observing a cancellation flag and absolute deadline.
+///
+/// The reader runs on a background thread because generic `Read` implementations
+/// can block. Stopping this iterator stops local delivery; it cannot cancel the
+/// remote request. A read already blocked in the operating system may finish
+/// later, as in the Python transport's local cancellation behavior.
+pub fn iter_sse_controlled<R>(
+    reader: R,
+    deadline: Option<Instant>,
+    cancelled: Arc<AtomicBool>,
+) -> ControlledSseIterator
+where
+    R: Read + Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel();
+    let stopped = Arc::new(AtomicBool::new(false));
+    let reader_stopped = Arc::clone(&stopped);
+    thread::spawn(move || {
+        let mut parser = SseReader::new(reader);
+        loop {
+            if reader_stopped.load(Ordering::Relaxed) {
+                break;
+            }
+            let item = match parser.next_event() {
+                Ok(Some(payload)) => Some(Ok(payload)),
+                Ok(None) => {
+                    let _ = sender.send(None);
+                    break;
+                }
+                Err(error) => Some(Err(AnyLLMError::network(format!(
+                    "connection broke while streaming: {}",
+                    error
+                ))
+                .with_hint(
+                    "The provider may have timed out. Retry, or use --timeout with a larger value.",
+                ))),
+            };
+            if let Some(item) = item {
+                let failed = item.is_err();
+                if sender.send(Some(item)).is_err() {
+                    break;
+                }
+                if parser.done || failed {
+                    break;
+                }
+            }
+        }
+    });
+    ControlledSseIterator {
+        receiver,
+        cancelled,
+        deadline,
+        stopped,
+        finished: false,
+    }
+}
+
+pub struct ControlledSseIterator {
+    receiver: mpsc::Receiver<Option<Result<String>>>,
+    cancelled: Arc<AtomicBool>,
+    deadline: Option<Instant>,
+    stopped: Arc<AtomicBool>,
+    finished: bool,
+}
+
+impl Iterator for ControlledSseIterator {
+    type Item = Result<String>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished {
+            return None;
+        }
+        loop {
+            let cancelled = self.cancelled.load(Ordering::Relaxed);
+            let deadline_elapsed = self
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline);
+            if cancelled || deadline_elapsed {
+                match self.receiver.try_recv() {
+                    Ok(Some(item)) => return Some(item),
+                    Ok(None) | Err(mpsc::TryRecvError::Disconnected) => {
+                        self.finished = true;
+                        return None;
+                    }
+                    Err(mpsc::TryRecvError::Empty) => {}
+                }
+                self.finished = true;
+                self.stopped.store(true, Ordering::Relaxed);
+                let message = if cancelled {
+                    "Streaming stopped locally after a cancel. The provider request was not cancelled."
+                } else {
+                    "The overall deadline elapsed while streaming. The provider request was not cancelled."
+                };
+                return Some(Err(local_stop_error(message)));
+            }
+            let wait = self
+                .deadline
+                .map(|deadline| {
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(50))
+                })
+                .unwrap_or(Duration::from_millis(50));
+            match self.receiver.recv_timeout(wait) {
+                Ok(Some(item)) => return Some(item),
+                Ok(None) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.finished = true;
+                    return None;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+    }
+}
+
+impl Drop for ControlledSseIterator {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Relaxed);
+    }
+}
+
+fn local_stop_error(message: &str) -> AnyLLMError {
+    AnyLLMError::network(message).with_hint(
+        "The provider may still be generating and may still charge for this request. Stopping the local read does not cancel it on the server.",
+    )
 }
 
 pub struct SseIterator<R: Read> {
