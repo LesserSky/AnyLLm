@@ -1,0 +1,12 @@
+[package]
+name = "anyllm-orch"
+version = "1.0.0"
+edition = "2021"
+description = "AnyLLM orchestration layer: targets, budgets, team fan-out, tool protocol, and the integration seam"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lib]
+name = "anyllm_orch"
