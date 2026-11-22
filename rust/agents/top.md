@@ -33,21 +33,23 @@ rustup component add rustfmt clippy
 Use these files, verbatim. Do not rewrite them.
 
 ```sh
-room-cli thread spawn --provider codex --model gpt-6.2-sol \
-  --reasoning-level high --title "Rust L1-A core" \
+room-cli thread spawn --provider codex --model gpt-6.1-terra \
+  --reasoning-level medium --title "Rust L1-A core" \
   --prompt-file rust/agents/l1-core.md
 
-room-cli thread spawn --provider codex --model gpt-6.2-sol \
-  --reasoning-level high --title "Rust L1-B interface" \
+room-cli thread spawn --provider codex --model gpt-6.1-terra \
+  --reasoning-level medium --title "Rust L1-B interface" \
   --prompt-file rust/agents/l1-interface.md
 
-room-cli thread spawn --provider codex --model gpt-6.2-sol \
-  --reasoning-level high --title "Rust L1-C orchestration" \
+room-cli thread spawn --provider codex --model gpt-6.1-terra \
+  --reasoning-level medium --title "Rust L1-C orchestration" \
   --prompt-file rust/agents/l1-orchestration.md
 ```
 
 Check `room-cli usage` before spawning. If fewer than 1200 Cloud Credits
 remain, spawn one lead, wait for it, then decide. Stop spawning below 300.
+If Codex returns a plan-limit error, stop and report to your parent. Do not
+retry, and do not switch models.
 
 ## While children run
 
