@@ -137,7 +137,7 @@ impl Chunk {
     }
 }
 
-/// JSON int-or-int-string-or-float coercion (Python `_int`).
+/// JSON int-or-digit-string-or-float coercion (Python `_int`).
 pub fn int_field(value: Option<&Value>) -> Option<i64> {
     match value {
         Some(Value::Bool(_)) | None => None,
@@ -145,7 +145,6 @@ pub fn int_field(value: Option<&Value>) -> Option<i64> {
         Some(Value::String(s)) if !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()) => {
             s.parse().ok()
         }
-        Some(Value::String(s)) => s.parse::<f64>().ok().map(|f| f as i64),
         _ => None,
     }
 }
@@ -275,13 +274,34 @@ fn gemini_usage(raw: Option<&Value>) -> Option<Usage> {
 }
 
 fn error_text(detail: &Value) -> String {
+    fn python_string(value: &Value) -> String {
+        match value {
+            Value::String(s) => s.clone(),
+            Value::Null => "None".to_string(),
+            Value::Bool(true) => "True".to_string(),
+            Value::Bool(false) => "False".to_string(),
+            Value::Number(n) => n.to_string(),
+            _ => value.to_string(),
+        }
+    }
+    fn truthy(value: &Value) -> bool {
+        match value {
+            Value::Null => false,
+            Value::Bool(v) => *v,
+            Value::Number(n) => n.as_f64().map(|v| v != 0.0).unwrap_or(true),
+            Value::String(s) => !s.is_empty(),
+            Value::Array(v) => !v.is_empty(),
+            Value::Object(v) => !v.is_empty(),
+        }
+    }
     match detail {
         Value::Object(map) => map
             .get("message")
-            .or_else(|| map.get("type"))
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| detail.to_string()),
-        other => other.to_string(),
+            .filter(|value| truthy(value))
+            .or_else(|| map.get("type").filter(|value| truthy(value)))
+            .map(python_string)
+            .unwrap_or_else(|| python_string(detail)),
+        other => python_string(other),
     }
 }
 
@@ -757,7 +777,12 @@ impl ChunkStream {
 /// Errors from opening the stream surface before the first chunk. `kind`
 /// dispatching matches Python `stream_chat`.
 pub fn stream_chat(provider: &Provider, args: &StreamArgs) -> Result<ChunkStream> {
-    let base = check_base_url(args.base_url.unwrap_or(&provider.base_url), provider)?;
+    let base = check_base_url(
+        args.base_url
+            .filter(|base| !base.is_empty())
+            .unwrap_or(&provider.base_url),
+        provider,
+    )?;
     let mut headers = provider.auth_headers(args.key);
     headers.extend(accept_sse());
     match provider.kind.as_str() {
@@ -772,7 +797,7 @@ pub fn stream_chat(provider: &Provider, args: &StreamArgs) -> Result<ChunkStream
                 payload["temperature"] = json!(temperature);
             }
             if let Some(max_tokens) = args.max_tokens {
-                if max_tokens > 0 {
+                if max_tokens != 0 {
                     payload[token_field(args.model)] = json!(max_tokens);
                 }
             }
@@ -813,7 +838,7 @@ pub fn stream_chat(provider: &Provider, args: &StreamArgs) -> Result<ChunkStream
                 .collect::<Vec<_>>();
             let mut payload = json!({
                 "model": args.model,
-                "max_tokens": args.max_tokens.unwrap_or(4096),
+                "max_tokens": args.max_tokens.filter(|value| *value != 0).unwrap_or(4096),
                 "messages": messages,
                 "stream": true,
             });
@@ -857,7 +882,7 @@ pub fn stream_chat(provider: &Provider, args: &StreamArgs) -> Result<ChunkStream
                 generation.insert("temperature".into(), json!(temperature));
             }
             if let Some(max_tokens) = args.max_tokens {
-                if max_tokens > 0 {
+                if max_tokens != 0 {
                     generation.insert("maxOutputTokens".into(), json!(max_tokens));
                 }
             }
@@ -889,7 +914,12 @@ pub fn list_models(
     base_url: Option<&str>,
     timeout: f64,
 ) -> Result<Vec<String>> {
-    let base = check_base_url(base_url.unwrap_or(&provider.base_url), provider)?;
+    let base = check_base_url(
+        base_url
+            .filter(|base| !base.is_empty())
+            .unwrap_or(&provider.base_url),
+        provider,
+    )?;
     let mut headers = provider.auth_headers(key);
     headers.push(("Accept".to_string(), "application/json".to_string()));
 
@@ -973,6 +1003,9 @@ pub fn list_models(
                         Some(Value::Array(methods)) if !methods.is_empty() => methods
                             .iter()
                             .any(|method| method.as_str() == Some("generateContent")),
+                        Some(Value::String(methods)) if !methods.is_empty() => {
+                            methods.contains("generateContent")
+                        }
                         _ => true,
                     }
                 })
