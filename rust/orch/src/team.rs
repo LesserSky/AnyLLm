@@ -838,7 +838,7 @@ pub fn execute_team_ask(
         ..RunOptions::default()
     };
     let cancel = Arc::new(AtomicBool::new(false));
-    let results = fan_out(
+    let mut results = fan_out(
         backend,
         &members,
         &snapshot,
@@ -848,6 +848,9 @@ pub fn execute_team_ask(
         cancel.clone(),
         &report.output_caps,
     );
+    for (result, member) in results.iter_mut().zip(&members) {
+        result.alias = member.name.clone();
+    }
     render_results(style, &results, view, width, interactive);
     let mut synthesis: Option<RunResult> = None;
     let mut sent: u64 = results.iter().map(|r| r.request_count).sum();

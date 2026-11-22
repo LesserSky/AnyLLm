@@ -73,9 +73,11 @@ fn setup() -> (TestHome, BTreeMap<String, Provider>) {
 fn fan_out_is_bounded_and_preserves_member_order() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (_home, providers) = setup();
+    anyllm_orch::targets::add_target("shared", "mock", "first", None, &providers, &EmptyKeyStore)
+        .unwrap();
     let members = vec![
-        ("slow".into(), "mock:first".into()),
-        ("fast".into(), "mock:second".into()),
+        ("slow".into(), "shared".into()),
+        ("fast".into(), "shared".into()),
         ("last".into(), "mock:third".into()),
     ];
     let backend = MockBackend::new();
