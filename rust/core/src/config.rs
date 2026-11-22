@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{json, Map, Value};
 
-use crate::errors::{AnyLLMError, Result};
+use crate::errors::{python_repr, AnyLLMError, Result};
 
 pub const APP_NAME: &str = "anyllm";
 
@@ -25,20 +25,23 @@ pub const ALLOWED_KEYS: &[&str] = &[
 
 pub fn config_dir() -> PathBuf {
     if let Ok(override_dir) = std::env::var("ANYLLM_HOME") {
-        return PathBuf::from(shellexpand_home(&override_dir));
+        if !override_dir.is_empty() {
+            return PathBuf::from(shellexpand_home(&override_dir));
+        }
     }
     if cfg!(windows) {
         let base = std::env::var("APPDATA")
+            .ok()
+            .filter(|v| !v.is_empty())
             .map(PathBuf::from)
-            .unwrap_or_else(|_| {
-                let home = home_dir();
-                home.join("AppData").join("Roaming")
-            });
+            .unwrap_or_else(|| home_dir().join("AppData").join("Roaming"));
         base.join(APP_NAME)
     } else {
         let base = std::env::var("XDG_CONFIG_HOME")
+            .ok()
+            .filter(|v| !v.is_empty())
             .map(PathBuf::from)
-            .unwrap_or_else(|_| home_dir().join(".config"));
+            .unwrap_or_else(|| home_dir().join(".config"));
         base.join(APP_NAME)
     }
 }
@@ -98,41 +101,68 @@ pub fn write_json(path: &Path, data: &Value, private: bool) -> Result<()> {
             AnyLLMError::config(format!("Could not create {}: {}", parent.display(), e))
         })?;
     }
-    let temp = path.with_extension(format!("{}.tmp", process_unique_suffix()));
-    let body = serde_json::to_string_pretty(data).unwrap_or_default();
-    let mut file = fs::File::create(&temp)
-        .map_err(|e| AnyLLMError::config(format!("Could not write {}: {}", temp.display(), e)))?;
-    if private {
+    let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("data");
+    let (mut file, temp_path) = loop {
+        let candidate =
+            path.with_file_name(format!(".{}.{}.tmp", file_name, process_unique_suffix()));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&temp, fs::Permissions::from_mode(0o600));
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(if private { 0o600 } else { 0o644 });
         }
-    }
-    file.write_all(body.as_bytes())
+        match options.open(&candidate) {
+            Ok(file) => break (file, candidate),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => {
+                return Err(AnyLLMError::config(format!(
+                    "Could not write {}: {}",
+                    candidate.display(),
+                    e
+                )))
+            }
+        }
+    };
+    let body = serde_json::to_string_pretty(data).unwrap_or_default();
+    let write_result = file
+        .write_all(body.as_bytes())
         .and_then(|_| file.write_all(b"\n"))
         .and_then(|_| file.sync_all())
-        .map_err(|e| AnyLLMError::config(format!("Could not write {}: {}", temp.display(), e)))?;
+        .map_err(|e| {
+            AnyLLMError::config(format!("Could not write {}: {}", temp_path.display(), e))
+        });
     drop(file);
-    fs::rename(&temp, path)
-        .map_err(|e| AnyLLMError::config(format!("Could not replace {}: {}", path.display(), e)))?;
-    if private {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-        }
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    if let Err(e) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(AnyLLMError::config(format!(
+            "Could not replace {}: {}",
+            path.display(),
+            e
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = if private { 0o600 } else { 0o644 };
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
     }
     Ok(())
 }
 
 fn process_unique_suffix() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("{}-{}", std::process::id(), now)
+    let counter = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}-{}-{}", std::process::id(), now, counter)
 }
 
 pub fn read_json(path: &Path, what: &str) -> Result<Map<String, Value>> {
@@ -228,7 +258,7 @@ impl Config {
     pub fn set(&mut self, key: &str, value: Value) -> Result<()> {
         if !ALLOWED_KEYS.contains(&key) && key != "custom_providers" {
             return Err(
-                AnyLLMError::config(format!("Unknown config key {:?}.", key))
+                AnyLLMError::config(format!("Unknown config key {}.", python_repr(key)))
                     .with_hint(format!("Known keys: {}", ALLOWED_KEYS.join(", "))),
             );
         }
@@ -239,7 +269,7 @@ impl Config {
     pub fn unset(&mut self, key: &str) -> Result<()> {
         if !ALLOWED_KEYS.contains(&key) {
             return Err(
-                AnyLLMError::config(format!("Unknown config key {:?}.", key))
+                AnyLLMError::config(format!("Unknown config key {}.", python_repr(key)))
                     .with_hint(format!("Known keys: {}", ALLOWED_KEYS.join(", "))),
             );
         }
@@ -273,7 +303,7 @@ pub fn parse_config_value(text: &str) -> Value {
     }
     match serde_json::from_str(stripped) {
         Ok(value) => value,
-        Err(_) => json!(stripped),
+        Err(_) => json!(text),
     }
 }
 
@@ -291,13 +321,19 @@ fn as_float(value: &Value, name: &str) -> Result<Option<f64>> {
 }
 
 fn bad_number(value: &Value, name: &str, hint: &str) -> AnyLLMError {
-    AnyLLMError::config(format!("Invalid {} value {}.", name, value)).with_hint(hint)
+    let shown = match value {
+        Value::String(text) => python_repr(text),
+        _ => value.to_string(),
+    };
+    AnyLLMError::config(format!("Invalid {} value {}.", name, shown)).with_hint(hint)
 }
 
 fn as_int(value: &Value, name: &str) -> Result<Option<i64>> {
     match value {
         Value::Null => Ok(None),
-        Value::Number(n) => Ok(n.as_i64()),
+        Value::Number(n) => Ok(n
+            .as_i64()
+            .or_else(|| n.as_f64().filter(|v| v.is_finite()).map(|v| v as i64))),
         Value::String(s) => s
             .parse::<i64>()
             .map(Some)

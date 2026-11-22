@@ -12,7 +12,7 @@ use serde_json::{json, Map, Value};
 use crate::adapters::{stream_chat, Chunk, Message, StreamArgs, Usage};
 use crate::catalog::{validate_base_url, Provider};
 use crate::config::{read_json, sessions_dir, write_json};
-use crate::errors::{AnyLLMError, Result};
+use crate::errors::{python_repr, AnyLLMError, Result};
 use crate::keystore::utc_now_iso;
 
 /// Stored on a partial assistant turn when the user hits Ctrl-C mid-stream.
@@ -54,8 +54,8 @@ pub fn session_base_url(
         Some(Value::String(saved)) if saved.trim().is_empty() => Ok(provider.base_url.clone()),
         Some(Value::String(saved)) => validate_base_url(saved).map_err(|exc| {
             AnyLLMError::config(format!(
-                "Saved session has an invalid base URL {:?}.",
-                saved
+                "Saved session has an invalid base URL {}.",
+                python_repr(saved)
             ))
             .with_hint(exc.hint.unwrap_or_default())
         }),
@@ -427,7 +427,7 @@ pub fn load_session_data(name: &str) -> Result<Map<String, Value>> {
     let path = session_path(name)?;
     if !path.exists() {
         return Err(
-            AnyLLMError::config(format!("Session {:?} was not found.", name))
+            AnyLLMError::config(format!("Session {} was not found.", python_repr(name)))
                 .with_hint("Run `/sessions` in chat to list saved sessions."),
         );
     }
@@ -446,16 +446,16 @@ pub fn load_session_data(name: &str) -> Result<Map<String, Value>> {
                     .unwrap_or(false);
                 if !ok {
                     return Err(AnyLLMError::config(format!(
-                        "Session {:?} contains an invalid message.",
-                        name
+                        "Session {} contains an invalid message.",
+                        python_repr(name)
                     ))
                     .with_hint(format!("Fix or delete {}", path.display())));
                 }
             }
         } else {
             return Err(AnyLLMError::config(format!(
-                "Session {:?} has an invalid message list.",
-                name
+                "Session {} has an invalid message list.",
+                python_repr(name)
             ))
             .with_hint(format!("Fix or delete {}", path.display())));
         }
@@ -465,10 +465,11 @@ pub fn load_session_data(name: &str) -> Result<Map<String, Value>> {
         .and_then(Value::as_str)
         .filter(|p| !p.is_empty());
     if provider.is_none() {
-        return Err(
-            AnyLLMError::config(format!("Session {:?} does not name a provider.", name))
-                .with_hint(format!("Fix or delete {}", path.display())),
-        );
+        return Err(AnyLLMError::config(format!(
+            "Session {} does not name a provider.",
+            python_repr(name)
+        ))
+        .with_hint(format!("Fix or delete {}", path.display())));
     }
     Ok(data)
 }
@@ -509,7 +510,14 @@ pub fn list_sessions() -> Vec<SessionEntry> {
             .get("updated")
             .and_then(Value::as_str)
             .map(str::to_string)
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                std::fs::metadata(&path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| utc_iso_from_secs(duration.as_secs()))
+                    .unwrap_or_default()
+            });
         entries.push(SessionEntry {
             name: path
                 .file_stem()
@@ -532,6 +540,32 @@ pub fn list_sessions() -> Vec<SessionEntry> {
     }
     entries.sort_by(|a, b| b.updated.cmp(&a.updated));
     entries
+}
+
+fn utc_iso_from_secs(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut year = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    if month <= 2 {
+        year += 1;
+    }
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}+00:00",
+        year,
+        month,
+        day,
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
 }
 
 pub fn latest_session_name() -> Option<String> {

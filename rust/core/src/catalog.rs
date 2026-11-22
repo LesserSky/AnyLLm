@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use serde_json::{json, Map, Value};
 
 use crate::config::Config;
-use crate::errors::{AnyLLMError, ErrorKind, Result};
+use crate::errors::{python_repr, AnyLLMError, ErrorKind, Result};
 
 pub const OPENAI: &str = "openai";
 pub const ANTHROPIC: &str = "anthropic";
@@ -269,7 +269,7 @@ pub fn validate_custom_name(name: &str) -> Result<String> {
     let cleaned = normalize_name(name);
     if !valid_name_shape(&cleaned) {
         return Err(
-            AnyLLMError::config(format!("Invalid provider name {:?}.", name)).with_hint(
+            AnyLLMError::config(format!("Invalid provider name {}.", python_repr(name))).with_hint(
                 "Use 1-39 letters, digits, dots, dashes, or underscores, \
                  starting with a letter or digit.",
             ),
@@ -277,8 +277,8 @@ pub fn validate_custom_name(name: &str) -> Result<String> {
     }
     if builtins().contains_key(&cleaned) {
         return Err(AnyLLMError::config(format!(
-            "{:?} is a built-in provider and cannot be redefined.",
-            cleaned
+            "{} is a built-in provider and cannot be redefined.",
+            python_repr(&cleaned)
         ))
         .with_hint("Pick another name, or use it directly with --provider."));
     }
@@ -312,8 +312,11 @@ pub fn validate_base_url(url: &str) -> Result<String> {
     };
     let host = rest.split(['/', '?', '#']).next().unwrap_or("");
     if (scheme != "http" && scheme != "https") || host.is_empty() {
-        return Err(AnyLLMError::config(format!("Invalid base URL {:?}.", url))
-            .with_hint("Use an http:// or https:// URL, for example https://api.example.com/v1"));
+        return Err(
+            AnyLLMError::config(format!("Invalid base URL {}.", python_repr(url))).with_hint(
+                "Use an http:// or https:// URL, for example https://api.example.com/v1",
+            ),
+        );
     }
     Ok(value.to_string())
 }
@@ -322,37 +325,37 @@ pub fn validate_base_url(url: &str) -> Result<String> {
 pub fn provider_from_spec(name: &str, spec: &Value) -> Result<Provider> {
     let spec_map = spec.as_object().ok_or_else(|| {
         AnyLLMError::config(format!(
-            "Provider {:?} in the config is not an object.",
-            name
+            "Provider {} in the config is not an object.",
+            python_repr(name)
         ))
         .with_hint("Fix the custom_providers entry in the config file, or remove it.")
     })?;
-    let kind = spec_map
-        .get("kind")
-        .and_then(Value::as_str)
-        .unwrap_or(OPENAI)
-        .trim()
-        .to_lowercase();
-    let kind = if kind.is_empty() {
-        OPENAI.to_string()
+    let kind_value = spec_map.get("kind").unwrap_or(&Value::Null);
+    let kind = if py_truthy(kind_value) {
+        py_string(kind_value).to_lowercase()
     } else {
-        kind
+        OPENAI.to_string()
     };
     if !KINDS.contains(&kind.as_str()) {
         return Err(AnyLLMError::config(format!(
-            "Provider {:?} has unsupported kind {:?}.",
-            name, kind
+            "Provider {} has unsupported kind {}.",
+            python_repr(name),
+            python_repr(&kind)
         ))
         .with_hint(format!("Use one of: {}", KINDS.join(", "))));
     }
-    let base_url_raw = spec_map
-        .get("base_url")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+    let base_url_value = spec_map.get("base_url").unwrap_or(&Value::Null);
+    let base_url_raw = if py_truthy(base_url_value) {
+        py_string(base_url_value)
+    } else {
+        String::new()
+    };
     let base_url = validate_base_url(&base_url_raw).map_err(|exc| {
-        AnyLLMError::config(format!("Provider {:?} has an invalid base URL.", name))
-            .with_hint(exc.hint.unwrap_or_default())
+        AnyLLMError::config(format!(
+            "Provider {} has an invalid base URL.",
+            python_repr(name)
+        ))
+        .with_hint(exc.hint.unwrap_or_default())
     })?;
 
     let string_list = |key: &str| -> Result<Vec<String>> {
@@ -367,37 +370,36 @@ pub fn provider_from_spec(name: &str, spec: &Value) -> Result<Provider> {
                         .collect())
                 } else {
                     Err(AnyLLMError::config(format!(
-                        "Provider {:?} has an invalid {:?} list in the config.",
-                        name, key
+                        "Provider {} has an invalid {} list in the config.",
+                        python_repr(name),
+                        python_repr(key)
                     )))
                 }
             }
             Some(_) => Err(AnyLLMError::config(format!(
-                "Provider {:?} has an invalid {:?} list in the config.",
-                name, key
+                "Provider {} has an invalid {} list in the config.",
+                python_repr(name),
+                python_repr(key)
             ))),
         }
     };
     let env = string_list("env")?;
     let models = string_list("models")?;
-    let label = spec_map
-        .get("label")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(name)
-        .to_string();
-    let key_required = match spec_map.get("key_required") {
-        None => true,
-        Some(value) => value.as_bool().unwrap_or(true),
+    let label_value = spec_map.get("label").unwrap_or(&Value::Null);
+    let label = if py_truthy(label_value) {
+        py_string(label_value)
+    } else {
+        name.to_string()
     };
-    let auth_header = spec_map
-        .get("auth_header")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("Authorization")
-        .to_string();
+    let key_required = spec_map.get("key_required").map(py_truthy).unwrap_or(true);
+    let auth_header_value = spec_map.get("auth_header").unwrap_or(&Value::Null);
+    let auth_header = if py_truthy(auth_header_value) {
+        py_string(auth_header_value)
+    } else {
+        "Authorization".to_string()
+    };
     let auth_prefix = match spec_map.get("auth_prefix") {
-        Some(Value::String(s)) => s.clone(),
+        Some(value) if !value.is_null() => py_string(value),
         _ => "Bearer ".to_string(),
     };
     Ok(Provider {
@@ -413,6 +415,27 @@ pub fn provider_from_spec(name: &str, spec: &Value) -> Result<Provider> {
         auth_header,
         auth_prefix,
     })
+}
+
+fn py_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(value) => value.as_f64().map(|n| n != 0.0).unwrap_or(true),
+        Value::String(value) => !value.is_empty(),
+        Value::Array(value) => !value.is_empty(),
+        Value::Object(value) => !value.is_empty(),
+    }
+}
+
+fn py_string(value: &Value) -> String {
+    match value {
+        Value::Null => "None".into(),
+        Value::Bool(value) => if *value { "True" } else { "False" }.into(),
+        Value::String(value) => value.clone(),
+        Value::Array(_) | Value::Object(_) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+    }
 }
 
 /// Merge built-ins with custom providers stored in the config.
@@ -437,8 +460,8 @@ pub fn load_providers(config: &Config) -> Result<BTreeMap<String, Provider>> {
         let name = normalize_name(raw_name);
         if name.is_empty() || builtins().contains_key(&name) {
             return Err(AnyLLMError::config(format!(
-                "Custom provider name {:?} is reserved or empty.",
-                raw_name
+                "Custom provider name {} is reserved or empty.",
+                python_repr(raw_name)
             ))
             .with_hint("Remove or rename that entry in the config file."));
         }
@@ -456,7 +479,7 @@ pub fn get_provider(name: &str, providers: &BTreeMap<String, Provider>) -> Resul
     }
     let available: Vec<String> = providers.keys().cloned().collect();
     Err(
-        AnyLLMError::config(format!("Unknown provider {:?}.", name)).with_hint(format!(
+        AnyLLMError::config(format!("Unknown provider {}.", python_repr(name))).with_hint(format!(
             "Available providers: {}. Add your own with \
          `anyllm providers add NAME --base-url URL`.",
             available.join(", ")
@@ -516,6 +539,6 @@ pub fn spec_map(spec: &Value) -> Option<Map<String, Value>> {
 pub fn unknown_kind_error(kind: &str) -> AnyLLMError {
     AnyLLMError::new(
         ErrorKind::Api,
-        format!("Unsupported provider kind {:?}.", kind),
+        format!("Unsupported provider kind {}.", python_repr(kind)),
     )
 }
