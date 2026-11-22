@@ -5,6 +5,17 @@ Project root: `/code/AnyLLm`. Read `rust/PORT_PLAN.md` and
 
 You own `rust/core/**`. Your branch is a copy of the top agent's branch.
 
+## Step 0: install Rust
+
+```sh
+if ! command -v cargo >/dev/null 2>&1; then
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+    sh -s -- -y --profile minimal --default-toolchain stable
+fi
+. "$HOME/.cargo/env"
+rustup component add rustfmt clippy
+```
+
 ## Step 1: verify
 
 ```sh
@@ -36,6 +47,10 @@ worker slices):
 ```
 You are <role> in the AnyLLM Rust port. Project root: /code/AnyLLm.
 Read rust/PORT_PLAN.md and rust/CONTRACTS.md first. The Python package is the spec.
+If cargo is missing, install Rust first:
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+  . "$HOME/.cargo/env"
+  rustup component add rustfmt clippy
 Mission: <work package from the plan>.
 Own only: <exclusive paths>.
 Spawn exactly <N> workers, all in your sandbox:
