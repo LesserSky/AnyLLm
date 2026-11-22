@@ -164,6 +164,9 @@ impl Session {
             max_tokens: self.max_tokens,
             timeout: self.timeout,
             include_usage: true,
+            tools: None,
+            deadline: None,
+            cancel: None,
         };
         let mut stream = match stream_chat(&self.provider, &args) {
             Ok(stream) => stream,

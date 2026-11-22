@@ -100,7 +100,22 @@ fn openai_compatible_provider_sends_payload_and_parses_tool_deltas() {
         "text/event-stream",
     );
     let custom = provider("custom", "Custom", OPENAI, &base);
-    let messages = [Message::new("user", "find x")];
+    let tool_specs = json!([{
+        "type": "function",
+        "function": {
+            "name": "lookup",
+            "parameters": {"type": "object"}
+        }
+    }]);
+    let messages = [
+        Message::new("user", "find x"),
+        Message::new("assistant", "").with_tool_calls(json!([{
+            "id": "call_previous",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": "{}"}
+        }])),
+        Message::new("tool", "found x").with_tool_call_id("call_previous"),
+    ];
     let args = StreamArgs {
         model: "custom-model",
         messages: &messages,
@@ -108,6 +123,7 @@ fn openai_compatible_provider_sends_payload_and_parses_tool_deltas() {
         key: Some("secret"),
         temperature: Some(0.25),
         max_tokens: Some(80),
+        tools: Some(&tool_specs),
         ..StreamArgs::default()
     };
     let mut stream = stream_chat(&custom, &args).unwrap();
@@ -143,6 +159,20 @@ fn openai_compatible_provider_sends_payload_and_parses_tool_deltas() {
         payload["messages"][1],
         json!({"role":"user", "content":"find x"})
     );
+    assert_eq!(payload["messages"][2]["role"], "assistant");
+    assert_eq!(
+        payload["messages"][2]["tool_calls"][0]["id"],
+        "call_previous"
+    );
+    assert_eq!(
+        payload["messages"][3],
+        json!({
+            "role":"tool",
+            "tool_call_id":"call_previous",
+            "content":"found x"
+        })
+    );
+    assert_eq!(payload["tools"], tool_specs);
     assert_eq!(payload["stream"], true);
     assert_eq!(payload["temperature"], 0.25);
     assert_eq!(payload["max_tokens"], 80);
@@ -266,4 +296,56 @@ fn zero_token_limit_uses_each_providers_python_default() {
     let request = server.join().unwrap();
     let payload: Value = serde_json::from_slice(&request.body).unwrap();
     assert!(payload.get("generationConfig").is_none());
+}
+
+#[test]
+fn non_openai_provider_rejects_tool_payload_before_auth_or_network() {
+    let anthropic = provider("anthropic", "Anthropic", ANTHROPIC, "http://127.0.0.1:9/v1");
+    let tools = json!([{"type":"function", "function":{"name":"f"}}]);
+    let args = StreamArgs {
+        tools: Some(&tools),
+        ..StreamArgs::default()
+    };
+    let error = match stream_chat(&anthropic, &args) {
+        Err(error) => error,
+        Ok(_) => panic!("expected unsupported-tools error"),
+    };
+    assert_eq!(
+        error.message,
+        "Tool calls are not implemented for provider kind 'anthropic'."
+    );
+    assert_eq!(
+        error.hint.as_deref(),
+        Some("Support stays unknown for this kind. No tools payload was sent.")
+    );
+}
+
+#[test]
+fn cancelled_or_expired_request_fails_before_opening_connection() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    let openai = provider("compat", "Compat", OPENAI, "http://127.0.0.1:9/v1");
+    let cancelled = Arc::new(AtomicBool::new(true));
+    let args = StreamArgs {
+        cancel: Some(Arc::clone(&cancelled)),
+        ..StreamArgs::default()
+    };
+    let error = match stream_chat(&openai, &args) {
+        Err(error) => error,
+        Ok(_) => panic!("expected cancellation error"),
+    };
+    assert!(error.message.contains("stopped locally after a cancel"));
+    cancelled.store(false, Ordering::Relaxed);
+
+    let args = StreamArgs {
+        deadline: Some(Instant::now() - Duration::from_millis(1)),
+        ..StreamArgs::default()
+    };
+    let error = match stream_chat(&openai, &args) {
+        Err(error) => error,
+        Ok(_) => panic!("expected deadline error"),
+    };
+    assert!(error.message.contains("overall deadline elapsed"));
 }
