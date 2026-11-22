@@ -14,7 +14,7 @@ struct Parsed {
     flags: Vec<String>,
 }
 
-fn parse_options(args: &[String]) -> Result<Parsed, AnyLLMError> {
+fn parse_options(args: &[String], command: &str) -> Result<Parsed, AnyLLMError> {
     let mut parsed = Parsed {
         pos: vec![],
         opts: BTreeMap::new(),
@@ -40,13 +40,13 @@ fn parse_options(args: &[String]) -> Result<Parsed, AnyLLMError> {
                 "-s" => "--system".to_string(),
                 _ => raw_key,
             };
-            if key == "--tools"
-                && inline.is_none()
-                && i + 1 < args.len()
-                && !args[i + 1].starts_with('-')
-            {
-                i += 1;
-                parsed.opts.entry(key).or_default().push(args[i].clone());
+            if key == "--tools" && command == "capabilities" {
+                if inline.is_some() {
+                    return Err(AnyLLMError::usage(
+                        "argument --tools: ignored explicit argument",
+                    ));
+                }
+                parsed.flags.push(key);
             } else if matches!(
                 key.as_str(),
                 "-h" | "--help"
@@ -157,7 +157,7 @@ pub fn run(args: Vec<String>) -> i32 {
             return 0;
         }
     }
-    let mut p = match parse_options(&args[1..]) {
+    let mut p = match parse_options(&args[1..], command) {
         Ok(x) => x,
         Err(e) => return err(e),
     };
@@ -175,10 +175,9 @@ pub fn run(args: Vec<String>) -> i32 {
         "doctor" => cmd_doctor(&p, &st),
         "targets" => cmd_targets(&p, &st),
         "prices" => cmd_prices(&p, &st),
-        "team" | "tools" | "capabilities" => Err(AnyLLMError::usage(format!(
-            "{} command is not available in this Rust build yet.",
-            command
-        ))),
+        "team" => cmd_team(&p, &st),
+        "tools" => cmd_tools(&p),
+        "capabilities" => cmd_capabilities(&p, &st),
         _ => {
             print!("{}", crate::args::HELP);
             return 2;
@@ -234,6 +233,53 @@ fn make_session(
     providers: &BTreeMap<String, Provider>,
     store: &KeyStore,
 ) -> Result<Session, AnyLLMError> {
+    if let Some(alias) = p.get("--target") {
+        if p.get("--provider").is_some()
+            || p.get("--model").is_some()
+            || p.get("--base-url").is_some()
+        {
+            return Err(AnyLLMError::usage(
+                "--target cannot be combined with --provider, --model, or --base-url.",
+            ));
+        }
+        let mapped = crate::bridge::providers(providers);
+        let wrapped = crate::bridge::Store(KeyStore {
+            path: store.path.clone(),
+        });
+        let resolved = anyllm_orch::targets::resolve_named(alias, &mapped, &wrapped, true)
+            .map_err(crate::bridge::core_error)?;
+        let system_config = c.get("system");
+        let system = p.get("--system").or_else(|| system_config.as_str());
+        let temp = p
+            .get("--temperature")
+            .and_then(|v| v.parse::<f64>().ok())
+            .map(|v| json!(v))
+            .unwrap_or_else(|| c.get("temperature"));
+        let max = p
+            .get("--max-tokens")
+            .and_then(|v| v.parse::<i64>().ok())
+            .map(|v| json!(v))
+            .unwrap_or_else(|| c.get("max_tokens"));
+        let mut session = Session::new(
+            crate::bridge::core_provider(&resolved.provider),
+            &resolved.target.model,
+            Some(&resolved.target.base_url),
+            resolved.credential.as_deref(),
+            &resolved.credential_source,
+            system,
+            core::validate_temperature(&temp)?,
+            core::validate_max_tokens(&max)?,
+            p.get("--timeout")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(120.0),
+            p.flag("--reasoning") || c.get("show_reasoning").as_bool() == Some(true),
+        );
+        session.target_alias = resolved.target.alias;
+        if let Some(warning) = resolved.http_warning {
+            eprintln!("{}", warning);
+        }
+        return Ok(session);
+    }
     let provider = choose_provider(p, c, providers, store)?;
     let base = if let Some(u) = p.get("--base-url") {
         core::validate_base_url(u)?
@@ -306,7 +352,7 @@ fn make_session(
         core::validate_max_tokens(&max)?,
         p.get("--timeout")
             .and_then(|v| v.parse().ok())
-            .unwrap_or(60.0),
+            .unwrap_or(120.0),
         p.flag("--reasoning") || c.get("show_reasoning").as_bool() == Some(true),
     ))
 }
@@ -329,6 +375,9 @@ fn cmd_ask(p: &Parsed, _st: &Style) -> Result<i32, AnyLLMError> {
     let (c, providers) = load()?;
     let store = KeyStore::new();
     let mut session = make_session(p, &c, &providers, &store)?;
+    if !p.all("--tools").is_empty() {
+        return ask_with_tools(p, &session, &prompt);
+    }
     let mut observer = core::NoObserver;
     let turn = session.send(&prompt, &mut observer)?;
     if p.flag("--json") {
@@ -351,7 +400,9 @@ fn cmd_chat(p: &Parsed, st: &Style) -> Result<i32, AnyLLMError> {
         let (config, providers) = load()?;
         let store = KeyStore::new();
         let session = make_session(p, &config, &providers, &store)?;
-        return Ok(crate::repl::Repl::new(session, *st, providers, store, config).run());
+        let mut repl = crate::repl::Repl::new(session, *st, providers, store, config);
+        repl.explicit_endpoint = p.get("--base-url").map(str::to_string);
+        return Ok(repl.run());
     }
     let mut prompt = String::new();
     io::stdin()
@@ -828,4 +879,225 @@ impl anyllm_orch::sys::KeyStore for OrchStore {
 }
 fn from_orch(e: anyllm_orch::sys::Error) -> AnyLLMError {
     AnyLLMError::config(e.message).with_hint_opt(e.hint)
+}
+
+fn cmd_tools(p: &Parsed) -> Result<i32, AnyLLMError> {
+    use anyllm_orch::tool_protocol as tools;
+    match p.pos.first().map(String::as_str).unwrap_or("list") {
+        "list" => {
+            let enabled = tools::enabled_tools().map_err(crate::bridge::core_error)?;
+            println!("Tools");
+            if enabled.is_empty() {
+                println!("  none enabled");
+            }
+            for name in enabled {
+                println!("  {}", name);
+            }
+            println!(
+                "  Support is unknown until a probe succeeds for the exact endpoint and model."
+            );
+        }
+        "enable" if p.pos.len() == 2 => {
+            tools::enable_tool(&p.pos[1]).map_err(crate::bridge::core_error)?;
+            println!(
+                "enabled {} (still requires a successful probe for the endpoint)",
+                p.pos[1]
+            );
+        }
+        "disable" if p.pos.get(1).map(String::as_str) == Some("all") => {
+            tools::disable_all_tools().map_err(crate::bridge::core_error)?;
+            println!("all tools disabled");
+        }
+        _ => {
+            return Err(AnyLLMError::usage(
+                "Usage: /tools list, /tools enable read_attached_file, or /tools disable all.",
+            ))
+        }
+    }
+    Ok(0)
+}
+fn cmd_capabilities(p: &Parsed, st: &Style) -> Result<i32, AnyLLMError> {
+    if p.pos.first().map(String::as_str) != Some("probe") {
+        return Err(AnyLLMError::usage("Expected capabilities probe."));
+    }
+    if !p.flag("--tools") {
+        return Err(AnyLLMError::usage("Name the capability to probe.")
+            .with_hint("anyllm capabilities probe --target NAME --tools"));
+    }
+    let name = p
+        .get("--target")
+        .ok_or_else(|| AnyLLMError::usage("argument --target is required"))?;
+    let (_, providers) = load()?;
+    let providers = crate::bridge::providers(&providers);
+    let store = crate::bridge::Store(KeyStore::new());
+    let resolved = anyllm_orch::targets::resolve_named(name, &providers, &store, true)
+        .map_err(crate::bridge::core_error)?;
+    println!("{}", st.yellow("This sends one small request and may incur a charge. The result applies only to this exact endpoint and model."));
+    println!(
+        "  {}/{}  {}",
+        resolved.target.provider, resolved.target.model, resolved.target.base_url
+    );
+    let timeout = p
+        .get("--timeout")
+        .unwrap_or("30")
+        .parse()
+        .map_err(|_| AnyLLMError::usage("Invalid timeout."))?;
+    let record = anyllm_orch::tool_protocol::probe_tools(
+        &crate::bridge::Backend,
+        &resolved.provider,
+        &resolved.target,
+        resolved.credential.as_deref(),
+        timeout,
+    )
+    .map_err(crate::bridge::core_error)?;
+    println!("tools: {}", record["tools"].as_str().unwrap_or("unknown"));
+    println!(
+        "{}",
+        st.dim(&format!("  {}", record["detail"].as_str().unwrap_or("")))
+    );
+    Ok(if record["tools"] == "unknown" && record["sent"] == true {
+        1
+    } else {
+        0
+    })
+}
+fn cmd_team(p: &Parsed, st: &Style) -> Result<i32, AnyLLMError> {
+    if p.pos.first().map(String::as_str) != Some("ask") {
+        return Err(AnyLLMError::usage("Expected team ask."));
+    }
+    let prompt = p.pos[1..].join(" ");
+    if prompt.trim().is_empty() {
+        return Err(AnyLLMError::usage("A prompt is required."));
+    }
+    let (_, providers) = load()?;
+    let providers = crate::bridge::providers(&providers);
+    let store = crate::bridge::Store(KeyStore::new());
+    let mut used = std::collections::BTreeSet::new();
+    let mut specs = Vec::new();
+    for spec in p.all("--member") {
+        let base = spec.split(':').next().unwrap_or("").trim().to_lowercase();
+        let mut name = base.clone();
+        let mut n = 2;
+        while !used.insert(name.clone()) {
+            name = format!("{}-{}", base, n);
+            n += 1;
+        }
+        specs.push((name, spec));
+    }
+    if specs.is_empty() {
+        specs = anyllm_orch::team::load_members()
+            .map_err(crate::bridge::core_error)?
+            .into_iter()
+            .map(|m| (m.name, m.spec))
+            .collect();
+    }
+    let parse_float = |key: &str| -> Result<Option<f64>, AnyLLMError> {
+        p.get(key)
+            .map(|v| {
+                v.parse()
+                    .map_err(|_| AnyLLMError::usage(format!("Invalid {}.", key)))
+            })
+            .transpose()
+    };
+    let max_tokens = p
+        .get("--max-tokens")
+        .map(|v| {
+            v.parse()
+                .map_err(|_| AnyLLMError::usage("Invalid --max-tokens."))
+        })
+        .transpose()?;
+    let concurrency = p
+        .get("--concurrency")
+        .unwrap_or("2")
+        .parse()
+        .map_err(|_| AnyLLMError::usage("Invalid --concurrency."))?;
+    anyllm_orch::team::execute_team_ask(
+        &crate::bridge::Backend,
+        &specs,
+        prompt.trim(),
+        &providers,
+        &store,
+        &[],
+        None,
+        None,
+        max_tokens,
+        parse_float("--timeout")?.unwrap_or(120.0),
+        parse_float("--deadline")?,
+        p.get("--view").unwrap_or("stacked"),
+        p.get("--merge"),
+        p.get("--budget-usd"),
+        concurrency,
+        p.flag("--yes"),
+        io::stdin().is_terminal(),
+        anyllm_orch::sys::Style::new(st.enabled),
+        80,
+    )
+    .map_err(crate::bridge::core_error)?;
+    Ok(0)
+}
+
+fn ask_with_tools(p: &Parsed, session: &Session, prompt: &str) -> Result<i32, AnyLLMError> {
+    use anyllm_orch::{seam, targets::Target, tool_protocol};
+    let target = Target::new(
+        &session.provider.name,
+        &session.model,
+        &session.base_url,
+        session.target_alias.as_deref(),
+    );
+    let snapshot = seam::make_snapshot(
+        &[],
+        session.system.as_deref(),
+        session.temperature,
+        session.max_tokens,
+        None,
+        false,
+        None,
+    );
+    let options = seam::RunOptions {
+        timeout: session.timeout,
+        temperature: session.temperature,
+        max_tokens: session.max_tokens,
+        show_reasoning: session.show_reasoning,
+        ..Default::default()
+    };
+    let max_rounds = p
+        .get("--max-tool-rounds")
+        .unwrap_or("1")
+        .parse()
+        .map_err(|_| AnyLLMError::usage("Invalid --max-tool-rounds."))?;
+    let result = tool_protocol::run_tool_conversation(
+        &crate::bridge::Backend,
+        &crate::bridge::provider(&session.provider),
+        &target,
+        &snapshot,
+        &options,
+        session.api_key.as_deref(),
+        prompt,
+        &p.all("--tools"),
+        max_rounds,
+        None,
+    )
+    .map_err(crate::bridge::core_error)?;
+    if p.flag("--json") {
+        let mut value = result.public_value();
+        value["tool_trace"] = json!(result.tool_trace);
+        println!("{}", serde_json::to_string_pretty(&value).unwrap());
+    } else {
+        if !result.text.is_empty() {
+            print!("{}", result.text);
+            if !result.text.ends_with('\n') {
+                println!();
+            }
+        }
+        if result.status != "ok" {
+            if let Some(error) = &result.error {
+                eprintln!("error: {}", error);
+            }
+        }
+    }
+    Ok(if result.status == "ok" || result.status == "incomplete" {
+        0
+    } else {
+        1
+    })
 }

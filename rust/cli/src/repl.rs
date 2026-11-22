@@ -26,6 +26,7 @@ pub struct Repl {
     pub providers: std::collections::BTreeMap<String, Provider>,
     pub store: KeyStore,
     pub config: Config,
+    pub explicit_endpoint: Option<String>,
     running: bool,
     history: Vec<String>,
 }
@@ -47,6 +48,7 @@ impl Repl {
             providers,
             store,
             config,
+            explicit_endpoint: None,
             running: true,
             history,
         };
@@ -241,6 +243,13 @@ impl Repl {
                 println!("{}", self.style.dim("bye"));
                 Ok(())
             }
+            _ if matches!(
+                name.as_str(),
+                "target" | "targets" | "prices" | "budget" | "tools" | "team"
+            ) =>
+            {
+                self.cmd_feature(&name, rest)
+            }
             _ => {
                 println!(
                     "{}",
@@ -260,8 +269,32 @@ impl Repl {
         }
     }
 
+    fn cmd_feature(&mut self, name: &str, rest: &str) -> Result<(), AnyLLMError> {
+        let mut registry = anyllm_orch::seam::ReplRegistry::default();
+        anyllm_orch::seam::install_repl_features(&mut registry);
+        anyllm_orch::tool_protocol::register(&mut registry);
+        anyllm_orch::team::register_with_backend(
+            &mut registry,
+            std::sync::Arc::new(crate::bridge::Backend),
+        );
+        let handler = registry
+            .get(name)
+            .ok_or_else(|| AnyLLMError::usage(format!("Unknown command /{}", name)))?;
+        let mut host = crate::bridge::ReplHost::from_core(
+            &self.session,
+            self.style,
+            &self.providers,
+            &self.store,
+        );
+        host.session.explicit_endpoint = self.explicit_endpoint.clone();
+        let result = handler(&mut host, rest).map_err(crate::bridge::core_error);
+        self.explicit_endpoint = host.session.explicit_endpoint.clone();
+        host.sync_core(&mut self.session);
+        result
+    }
+
     fn cmd_help(&self) -> Result<(), AnyLLMError> {
-        let rows = vec![
+        let mut rows = vec![
             ("/help", "show this list"),
             ("/model NAME", "switch model"),
             ("/models [TEXT]", "list models available to this key"),
@@ -297,6 +330,19 @@ impl Repl {
             ("/keys", "show which key this provider uses"),
             ("/exit", "quit"),
         ];
+        let mut registry = anyllm_orch::seam::ReplRegistry::default();
+        anyllm_orch::seam::install_repl_features(&mut registry);
+        anyllm_orch::tool_protocol::register(&mut registry);
+        anyllm_orch::team::register_with_backend(
+            &mut registry,
+            std::sync::Arc::new(crate::bridge::Backend),
+        );
+        rows.extend(
+            registry
+                .help_rows
+                .iter()
+                .map(|(command, description)| (command.as_str(), description.as_str())),
+        );
         println!("{}", self.style.bold("Commands"));
         let rows = rows
             .iter()
