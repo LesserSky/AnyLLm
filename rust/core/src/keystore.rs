@@ -16,7 +16,7 @@ use serde_json::{json, Map, Value};
 
 use crate::catalog::{builtins, Provider, OPENAI};
 use crate::config::{keys_path, read_json, write_json};
-use crate::errors::{AnyLLMError, Result};
+use crate::errors::{python_repr, AnyLLMError, Result};
 
 pub const SCHEME_DPAPI: &str = "dpapi";
 pub const SCHEME_PLAIN: &str = "plain";
@@ -137,11 +137,9 @@ pub fn mask_key(value: &str) -> String {
     if chars.len() <= 8 {
         return "*".repeat(chars.len());
     }
-    format!(
-        "{}...{}",
-        value[..4].to_string(),
-        value[chars.len() - 4..].to_string()
-    )
+    let start: String = chars[..4].iter().collect();
+    let end: String = chars[chars.len() - 4..].iter().collect();
+    format!("{}...{}", start, end)
 }
 
 fn env_slug(name: &str) -> String {
@@ -226,7 +224,11 @@ impl KeyStore {
             None => {
                 data.insert("keys".into(), json!({}));
             }
-            Some(Value::Object(_)) => {}
+            Some(Value::Object(_)) | Some(Value::Null) => {
+                if data.get("keys").map(Value::is_null).unwrap_or(false) {
+                    data.insert("keys".into(), json!({}));
+                }
+            }
             Some(_) => {
                 return Err(AnyLLMError::config(
                     "The key store is malformed: 'keys' must be an object.",
@@ -268,21 +270,27 @@ impl KeyStore {
             Some(entry) => entry,
         };
         let entry = entry.as_object().ok_or_else(|| {
-            AnyLLMError::config(format!("The saved key for {:?} is malformed.", provider))
-                .with_hint(format!("Run `anyllm keys set {}` again.", provider))
+            AnyLLMError::config(format!(
+                "The saved key for {} is malformed.",
+                python_repr(provider)
+            ))
+            .with_hint(format!("Run `anyllm keys set {}` again.", provider))
         })?;
         let scheme = entry.get("scheme").and_then(Value::as_str).unwrap_or("");
         let encoded = entry.get("value").and_then(Value::as_str).unwrap_or("");
         if encoded.is_empty() {
             return Err(AnyLLMError::config(format!(
-                "The saved key for {:?} is empty or malformed.",
-                provider
+                "The saved key for {} is empty or malformed.",
+                python_repr(provider)
             ))
             .with_hint(format!("Run `anyllm keys set {}` again.", provider)));
         }
         let raw = BASE64.decode(encoded.as_bytes()).map_err(|_| {
-            AnyLLMError::config(format!("The saved key for {:?} is corrupted.", provider))
-                .with_hint(format!("Run `anyllm keys set {}` again.", provider))
+            AnyLLMError::config(format!(
+                "The saved key for {} is corrupted.",
+                python_repr(provider)
+            ))
+            .with_hint(format!("Run `anyllm keys set {}` again.", provider))
         })?;
         if scheme == SCHEME_PLAIN {
             return String::from_utf8(raw)
@@ -292,9 +300,9 @@ impl KeyStore {
         if scheme == SCHEME_DPAPI {
             if !dpapi_available() {
                 return Err(AnyLLMError::config(format!(
-                    "The key for {:?} was encrypted with Windows DPAPI \
+                    "The key for {} was encrypted with Windows DPAPI \
                      and cannot be read on this system.",
-                    provider
+                    python_repr(provider)
                 ))
                 .with_hint(format!(
                     "Set it again on this machine: anyllm keys set {}",
@@ -306,12 +314,11 @@ impl KeyStore {
                 return dpapi::unprotect(&raw)
                     .map_err(|e| {
                         AnyLLMError::config(format!(
-                            "The saved key for {:?} could not be decrypted: {}",
-                            provider, e
+                            "The saved key for {} could not be decrypted: {}",
+                            python_repr(provider), e
                         ))
                         .with_hint(
-                            "It was probably saved by a different Windows user. \
-                                    Run `anyllm keys set {}` again.",
+                            format!("It was probably saved by a different Windows user. Run `anyllm keys set {}` again.", provider),
                         )
                     })
                     .and_then(|bytes| {
@@ -324,8 +331,9 @@ impl KeyStore {
             return Err(corrupted(provider));
         }
         Err(AnyLLMError::config(format!(
-            "The saved key for {:?} uses unknown encryption {:?}.",
-            provider, scheme
+            "The saved key for {} uses unknown encryption {}.",
+            python_repr(provider),
+            python_repr(scheme)
         ))
         .with_hint(format!("Run `anyllm keys set {}` again.", provider)))
     }
@@ -342,7 +350,9 @@ impl KeyStore {
             return Err(AnyLLMError::config("That API key contains whitespace.")
                 .with_hint("Paste the key without spaces or quotes."));
         }
+        #[allow(unused_mut)]
         let mut scheme = SCHEME_PLAIN.to_string();
+        #[allow(unused_mut)]
         let mut payload = key.as_bytes().to_vec();
         if dpapi_available() {
             #[cfg(windows)]
@@ -424,8 +434,11 @@ impl KeyStore {
 }
 
 fn corrupted(provider: &str) -> AnyLLMError {
-    AnyLLMError::config(format!("The saved key for {:?} is corrupted.", provider))
-        .with_hint(format!("Run `anyllm keys set {}` again.", provider))
+    AnyLLMError::config(format!(
+        "The saved key for {} is corrupted.",
+        python_repr(provider)
+    ))
+    .with_hint(format!("Run `anyllm keys set {}` again.", provider))
 }
 
 /// Whether the generic `ANYLLM_API_KEY` may be sent to this provider.

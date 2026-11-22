@@ -24,6 +24,7 @@ pub const ERROR: &str = "\x1b[1;31m";
 pub const HINT: &str = "\x1b[2;33m";
 pub const REASONING: &str = "\x1b[2;3m";
 
+#[cfg(windows)]
 const ENABLE_VT: u32 = 0x0004;
 
 /// Query keys whose values are credentials. `api-version` is not secret.
@@ -413,7 +414,7 @@ pub fn format_table(style: &Style, headers: &[&str], rows: &[Vec<String>]) -> Ve
     let width_count = headers.len();
     let mut normalized: Vec<Vec<String>> = Vec::with_capacity(rows.len());
     for row in rows {
-        let mut cells: Vec<String> = row.iter().map(|cell| cell.trim().to_string()).collect();
+        let mut cells: Vec<String> = row.clone();
         cells.truncate(width_count);
         while cells.len() < width_count {
             cells.push(String::new());
