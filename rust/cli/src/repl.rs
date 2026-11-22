@@ -4,173 +4,17 @@
 //! input loop, history persistence, streaming display, and slash commands in
 //! the CLI crate so the lower-level session and terminal APIs stay reusable.
 
-use std::fs;
-use std::io::{self, BufRead, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
-
+use crate::render::StreamPrinter;
 use anyllm_core as core;
 use core::{AnyLLMError, Config, KeyStore, Provider, Session, SessionObserver, Style, Turn, Usage};
 use serde_json::{Map, Value};
-
-/// Print streamed answer text and reasoning while keeping code fences muted.
-pub struct StreamPrinter {
-    style: Style,
-    show_reasoning: bool,
-    spinner: bool,
-    in_code: bool,
-    wrote_text: bool,
-    wrote_reasoning: bool,
-    last: char,
-    spinner_stop: Arc<AtomicBool>,
-    output_lock: Arc<Mutex<()>>,
-    spinner_thread: Option<thread::JoinHandle<()>>,
-}
-
-impl StreamPrinter {
-    pub fn new(style: Style, show_reasoning: bool, spinner: bool) -> Self {
-        StreamPrinter {
-            style,
-            show_reasoning,
-            spinner,
-            in_code: false,
-            wrote_text: false,
-            wrote_reasoning: false,
-            last: '\0',
-            spinner_stop: Arc::new(AtomicBool::new(false)),
-            output_lock: Arc::new(Mutex::new(())),
-            spinner_thread: None,
-        }
-    }
-
-    pub fn begin(&mut self) {
-        if !self.spinner || self.spinner_thread.is_some() {
-            return;
-        }
-        self.spinner_stop.store(false, Ordering::SeqCst);
-        let stop = Arc::clone(&self.spinner_stop);
-        let lock = Arc::clone(&self.output_lock);
-        let style = self.style;
-        self.spinner_thread = Some(thread::spawn(move || {
-            let frames = if style.enabled {
-                "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-            } else {
-                "|/-\\"
-            };
-            let frames: Vec<char> = frames.chars().collect();
-            let mut i = 0;
-            while !stop.load(Ordering::SeqCst) {
-                if let Ok(_guard) = lock.lock() {
-                    if stop.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    let frame = frames[i % frames.len()].to_string();
-                    if style.enabled {
-                        print!("\r{}\x1b[K", style.accent(&frame));
-                    } else {
-                        print!("\r{}", frame);
-                    }
-                    let _ = io::stdout().flush();
-                }
-                i += 1;
-                thread::sleep(Duration::from_millis(80));
-            }
-        }));
-    }
-
-    fn clear_indicator(&mut self) {
-        self.spinner_stop.store(true, Ordering::SeqCst);
-        if let Some(handle) = self.spinner_thread.take() {
-            if handle.thread().id() != thread::current().id() {
-                let _ = handle.join();
-            }
-            if let Ok(_guard) = self.output_lock.lock() {
-                if self.style.enabled {
-                    print!("\r\x1b[2K");
-                } else {
-                    print!("\r \r");
-                }
-                let _ = io::stdout().flush();
-            }
-        }
-    }
-
-    fn write(&self, text: &str) {
-        if let Ok(_guard) = self.output_lock.lock() {
-            print!("{}", text);
-            let _ = io::stdout().flush();
-        }
-    }
-
-    pub fn text(&mut self, value: &str) {
-        if value.is_empty() {
-            return;
-        }
-        self.clear_indicator();
-        if self.show_reasoning
-            && self.wrote_reasoning
-            && !self.wrote_text
-            && self.last != '\n'
-            && self.last != '\0'
-        {
-            self.write("\n");
-        }
-        let mut rest = value;
-        while let Some(index) = rest.find("```") {
-            self.emit(&rest[..index], None);
-            self.emit("```", Some(true));
-            self.in_code = !self.in_code;
-            rest = &rest[index + 3..];
-        }
-        self.emit(rest, None);
-        self.wrote_text = true;
-        self.last = value.chars().last().unwrap_or('\0');
-    }
-
-    fn emit(&self, value: &str, code: Option<bool>) {
-        if value.is_empty() {
-            return;
-        }
-        let code = code.unwrap_or(self.in_code);
-        if self.style.enabled && code {
-            self.write(&self.style.code(value));
-        } else {
-            self.write(value);
-        }
-    }
-
-    pub fn reasoning(&mut self, value: &str) {
-        if value.is_empty() {
-            return;
-        }
-        self.clear_indicator();
-        if !self.show_reasoning {
-            self.wrote_reasoning = true;
-            return;
-        }
-        if !self.wrote_reasoning {
-            self.write(&self.style.muted("reasoning:\n"));
-        }
-        self.write(&self.style.reasoning(value));
-        self.wrote_reasoning = true;
-        self.last = value.chars().last().unwrap_or('\0');
-    }
-
-    pub fn end(&mut self) {
-        self.clear_indicator();
-        if self.last != '\0' && self.last != '\n' {
-            self.write("\n");
-        }
-    }
-}
+use std::fs;
+use std::io::{self, BufRead, Write};
 
 impl SessionObserver for StreamPrinter {
     fn on_text(&mut self, text: &str) {
         self.text(text);
     }
-
     fn on_reasoning(&mut self, text: &str) {
         self.reasoning(text);
     }

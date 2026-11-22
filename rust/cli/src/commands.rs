@@ -348,9 +348,10 @@ fn cmd_ask(p: &Parsed, _st: &Style) -> Result<i32, AnyLLMError> {
 }
 fn cmd_chat(p: &Parsed, st: &Style) -> Result<i32, AnyLLMError> {
     if io::stdin().is_terminal() {
-        return Err(AnyLLMError::usage(
-            "Interactive chat is not implemented yet.",
-        ));
+        let (config, providers) = load()?;
+        let store = KeyStore::new();
+        let session = make_session(p, &config, &providers, &store)?;
+        return Ok(crate::repl::Repl::new(session, *st, providers, store, config).run());
     }
     let mut prompt = String::new();
     io::stdin()
