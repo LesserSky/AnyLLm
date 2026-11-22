@@ -1,0 +1,55 @@
+name: Rust
+
+on:
+  push:
+    paths:
+      - "rust/**"
+      - ".github/workflows/rust.yml"
+  pull_request:
+    paths:
+      - "rust/**"
+      - ".github/workflows/rust.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Checks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --manifest-path rust/Cargo.toml --all -- --check
+      - name: Format quality fixtures
+        run: cargo fmt --manifest-path rust/tests/Cargo.toml --all -- --check
+      - name: Clippy
+        run: cargo clippy --manifest-path rust/Cargo.toml --workspace --all-targets -- -A clippy::never_loop
+      - name: Test workspace
+        run: cargo test --manifest-path rust/Cargo.toml --workspace
+      - name: Mock HTTP fixtures
+        run: cargo test --manifest-path rust/tests/Cargo.toml
+      - name: CLI golden output
+        if: runner.os != 'Windows'
+        run: sh rust/tests/cli_parity.sh
+      - name: Release binary
+        run: cargo build --manifest-path rust/Cargo.toml --release -p anyllm-cli --bin anyllm
+      - name: Stage release binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          if [ "$RUNNER_OS" = "Windows" ]; then cp rust/target/release/anyllm.exe dist/; else cp rust/target/release/anyllm dist/; fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: anyllm-${{ runner.os }}-${{ runner.arch }}
+          path: dist/*
+          if-no-files-found: error
