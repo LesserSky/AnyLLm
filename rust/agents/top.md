@@ -6,6 +6,17 @@ anything else. The Python package is the spec.
 
 ## First 30 minutes
 
+0. Install Rust if it is missing:
+
+```sh
+if ! command -v cargo >/dev/null 2>&1; then
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+    sh -s -- -y --profile minimal --default-toolchain stable
+fi
+. "$HOME/.cargo/env"
+rustup component add rustfmt clippy
+```
+
 1. Verify the baseline: `cd rust && cargo test --workspace`. It must be green
    (63 tests). If it is not, fix only the baseline before spawning.
 2. Read `rust/core/src/lib.rs`, `rust/orch/src/lib.rs`, `rust/Cargo.toml`,
