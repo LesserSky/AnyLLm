@@ -81,8 +81,16 @@ impl AttachmentStore {
                 None,
             ));
         }
-        if attachment.path.replace('\\', "/").split('/').any(|part| part == "..") {
-            return Err(Error::usage("Approved attachment paths cannot contain '..'.", None));
+        if attachment
+            .path
+            .replace('\\', "/")
+            .split('/')
+            .any(|part| part == "..")
+        {
+            return Err(Error::usage(
+                "Approved attachment paths cannot contain '..'.",
+                None,
+            ));
         }
         self.items.insert(attachment.path.clone(), attachment);
         Ok(())
@@ -221,13 +229,23 @@ pub struct RunOptions {
 impl Default for RunOptions {
     /// Python's dataclass default: 120 s timeout, everything else unset.
     fn default() -> RunOptions {
-        RunOptions { timeout: 120.0, deadline: None, temperature: None, max_tokens: None, show_reasoning: false, tools_payload: None }
+        RunOptions {
+            timeout: 120.0,
+            deadline: None,
+            temperature: None,
+            max_tokens: None,
+            show_reasoning: false,
+            tools_payload: None,
+        }
     }
 }
 
 impl RunOptions {
     pub fn new(timeout: f64) -> RunOptions {
-        RunOptions { timeout, ..Default::default() }
+        RunOptions {
+            timeout,
+            ..Default::default()
+        }
     }
 }
 
@@ -338,7 +356,10 @@ pub struct CapturedPresentation {
 
 impl CapturedPresentation {
     pub fn new(style: Style) -> CapturedPresentation {
-        CapturedPresentation { style, lines: Vec::new() }
+        CapturedPresentation {
+            style,
+            lines: Vec::new(),
+        }
     }
 
     pub fn line(&mut self, text: &str) {
@@ -399,7 +420,11 @@ pub fn run_request(
     if let Some(flag) = &cancel {
         if flag.load(Ordering::SeqCst) {
             emit(call.events, RunEvent::status(&label, "cancelled"));
-            return blank("cancelled", target, "Cancelled before the request was sent.");
+            return blank(
+                "cancelled",
+                target,
+                "Cancelled before the request was sent.",
+            );
         }
     }
 
@@ -495,8 +520,10 @@ pub fn run_request(
         Err(error) => {
             let status = match error.kind {
                 ErrorKind::Network => {
-                    let cancelled =
-                        cancel.as_ref().map(|flag| flag.load(Ordering::SeqCst)).unwrap_or(false);
+                    let cancelled = cancel
+                        .as_ref()
+                        .map(|flag| flag.load(Ordering::SeqCst))
+                        .unwrap_or(false);
                     let timed_out = options
                         .deadline
                         .map(|deadline| Instant::now() >= deadline)
@@ -536,15 +563,18 @@ pub fn run_request(
         Some("length") | Some("max_tokens") | Some("max_completion_tokens")
     );
     let mut incomplete = length_capped;
-    let mut status =
-        if incomplete && deltas.is_empty() { "incomplete" } else { "ok" }.to_string();
+    let mut status = if incomplete && deltas.is_empty() {
+        "incomplete"
+    } else {
+        "ok"
+    }
+    .to_string();
     let mut error: Option<String> = None;
     if text.trim().is_empty() && deltas.is_empty() {
         if length_capped {
             // finish_reason is evidence the output cap stopped the reply.
             status = "incomplete".to_string();
-            let mut message =
-                "The output cap was exhausted before any answer text.".to_string();
+            let mut message = "The output cap was exhausted before any answer text.".to_string();
             if !reasoning.trim().is_empty() {
                 message.push_str(" Reasoning was returned.");
             }
@@ -717,18 +747,24 @@ pub fn read_json(path: &Path, what: &str) -> Result<Map<String, Value>, Error> {
 pub fn write_json(path: &Path, data: &Value, private: bool) -> Result<(), Error> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|exc| {
-            Error::config(format!("Could not create {}: {}", parent.display(), exc), None)
+            Error::config(
+                format!("Could not create {}: {}", parent.display(), exc),
+                None,
+            )
         })?;
     }
     let mut body = serde_json::to_string_pretty(data).unwrap_or_default();
     body.push('\n');
     let temp_name = format!(
         ".{}.{}.tmp",
-        path.file_name().and_then(|name| name.to_str()).unwrap_or("state"),
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("state"),
         std::process::id()
     );
     let temp_path = path.with_file_name(temp_name);
-    let write_result = std::fs::write(&temp_path, body.as_bytes()).and_then(|_| set_permissions(&temp_path, private));
+    let write_result = std::fs::write(&temp_path, body.as_bytes())
+        .and_then(|_| set_permissions(&temp_path, private));
     if let Err(exc) = write_result {
         let _ = std::fs::remove_file(&temp_path);
         return Err(Error::config(
@@ -777,8 +813,7 @@ pub trait Repl {
 }
 
 /// One registered REPL command: `(repl, rest) -> Result`.
-pub type ReplHandler =
-    Arc<dyn Fn(&mut dyn Repl, &str) -> Result<(), Error> + Send + Sync>;
+pub type ReplHandler = Arc<dyn Fn(&mut dyn Repl, &str) -> Result<(), Error> + Send + Sync>;
 
 /// Registered REPL commands, mirroring `seam.REPL_HANDLERS` + `HELP_ROWS`.
 #[derive(Default)]
@@ -789,12 +824,7 @@ pub struct ReplRegistry {
 
 impl ReplRegistry {
     /// Register a REPL command. Safe to call for the same row twice.
-    pub fn register(
-        &mut self,
-        name: &str,
-        handler: ReplHandler,
-        help_row: Option<(&str, &str)>,
-    ) {
+    pub fn register(&mut self, name: &str, handler: ReplHandler, help_row: Option<(&str, &str)>) {
         self.handlers.insert(name.to_string(), handler);
         if let Some(row) = help_row {
             let row = (row.0.to_string(), row.1.to_string());
@@ -869,9 +899,15 @@ mod tests {
     #[test]
     fn attachment_store_rejects_dotdot_and_keeps_order() {
         let mut store = AttachmentStore::default();
-        store.approve(ApprovedAttachment::new("b.txt", "hash", "B")).unwrap();
-        store.approve(ApprovedAttachment::new("a.txt", "hash", "A")).unwrap();
-        assert!(store.approve(ApprovedAttachment::new("../x", "h", "C")).is_err());
+        store
+            .approve(ApprovedAttachment::new("b.txt", "hash", "B"))
+            .unwrap();
+        store
+            .approve(ApprovedAttachment::new("a.txt", "hash", "A"))
+            .unwrap();
+        assert!(store
+            .approve(ApprovedAttachment::new("../x", "h", "C"))
+            .is_err());
         let list = store.list();
         assert_eq!(list[0].path, "a.txt");
         assert_eq!(list.len(), 2);
@@ -880,8 +916,14 @@ mod tests {
     #[test]
     fn run_request_collects_text_usage_and_finish_reason() {
         let backend = FakeBackend(vec![
-            Chunk { text: "hel".into(), ..Default::default() },
-            Chunk { text: "lo".into(), ..Default::default() },
+            Chunk {
+                text: "hel".into(),
+                ..Default::default()
+            },
+            Chunk {
+                text: "lo".into(),
+                ..Default::default()
+            },
             Chunk {
                 usage: Some(Usage {
                     input_tokens: Some(3),
@@ -890,7 +932,10 @@ mod tests {
                 }),
                 ..Default::default()
             },
-            Chunk { finish_reason: Some("stop".into()), ..Default::default() },
+            Chunk {
+                finish_reason: Some("stop".into()),
+                ..Default::default()
+            },
         ]);
         let provider = Provider::new("mock", "Mock", crate::sys::OPENAI, "http://x/v1");
         let snapshot = make_snapshot(
