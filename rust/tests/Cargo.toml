@@ -1,0 +1,15 @@
+[package]
+name = "anyllm-quality-tests"
+version = "1.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[[test]]
+name = "mock_http"
+path = "mock_http.rs"
+
+[dependencies]
+anyllm-core = { path = "../core" }
+serde_json = "1"
