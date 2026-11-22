@@ -31,14 +31,14 @@ Write each prompt file in `/tmp`, then spawn. Do not use built-in subagents,
 `codex`, or `claude` CLIs.
 
 ```sh
-room-cli thread spawn --provider codex --model gpt-6.2-astra \
-  --reasoning-level high --title "Rust B1 CLI" \
+room-cli thread spawn --provider codex --model gpt-6-luna \
+  --reasoning-level medium --title "Rust B1 CLI" \
   --prompt-file /tmp/b1.md
-room-cli thread spawn --provider codex --model gpt-6.2-astra \
-  --reasoning-level high --title "Rust B2 REPL" \
+room-cli thread spawn --provider codex --model gpt-6-luna \
+  --reasoning-level medium --title "Rust B2 REPL" \
   --prompt-file /tmp/b2.md
-room-cli thread spawn --provider codex --model gpt-6.2-astra \
-  --reasoning-level high --title "Rust B3 render" \
+room-cli thread spawn --provider codex --model gpt-6-luna \
+  --reasoning-level medium --title "Rust B3 render" \
   --prompt-file /tmp/b3.md
 ```
 
@@ -66,6 +66,7 @@ After all workers report: review every diff, run cargo fmt and
 cargo test -p anyllm-cli, commit, push, and report:
 DONE role=<role> branch=<branch> commit=<sha> tests=<passed>/<total> gaps=<...>
 Do not spawn more workers than assigned. Do not edit other crates.
+If Codex returns a plan-limit error, stop and report to your parent; do not retry.
 ```
 
 Assignments:
