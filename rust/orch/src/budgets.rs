@@ -64,7 +64,12 @@ pub struct PlannedCall {
 }
 
 impl PlannedCall {
-    pub fn new(key: &str, label: &str, input_tokens_estimate: i64, output_token_cap: Option<i64>) -> PlannedCall {
+    pub fn new(
+        key: &str,
+        label: &str,
+        input_tokens_estimate: i64,
+        output_token_cap: Option<i64>,
+    ) -> PlannedCall {
         PlannedCall {
             key: key.to_string(),
             label: label.to_string(),
@@ -183,7 +188,10 @@ pub fn load_prices() -> Result<BTreeMap<String, Price>> {
     let mut prices = BTreeMap::new();
     for (name, spec) in &raw {
         if !spec.is_object() {
-            return Err(Error::config(format!("Price {:?} is malformed.", name), None));
+            return Err(Error::config(
+                format!("Price {:?} is malformed.", name),
+                None,
+            ));
         }
         let input_per_million = money(
             spec.get("input_per_million").unwrap_or(&Value::Null),
@@ -195,10 +203,8 @@ pub fn load_prices() -> Result<BTreeMap<String, Price>> {
             "output rate",
         )
         .map_err(|exc| Error::config(format!("Price {:?} is malformed.", name), exc.hint))?;
-        let currency_text = currency(
-            spec.get("currency").and_then(Value::as_str),
-        )
-        .map_err(|exc| Error::config(format!("Price {:?} is malformed.", name), exc.hint))?;
+        let currency_text = currency(spec.get("currency").and_then(Value::as_str))
+            .map_err(|exc| Error::config(format!("Price {:?} is malformed.", name), exc.hint))?;
         prices.insert(
             name.clone(),
             Price {
@@ -270,7 +276,11 @@ fn positive_int(value: Option<&Value>, name: &str) -> Result<Option<i64>> {
         Some(Value::Number(number)) => match number.as_i64() {
             Some(parsed) if parsed > 0 => Ok(Some(parsed)),
             _ => Err(Error::config(
-                format!("Invalid {} {}", name, value_text(value.unwrap_or(&Value::Null))),
+                format!(
+                    "Invalid {} {}",
+                    name,
+                    value_text(value.unwrap_or(&Value::Null))
+                ),
                 Some("Use a positive whole number.".to_string()),
             )),
         },
@@ -282,7 +292,11 @@ fn positive_int(value: Option<&Value>, name: &str) -> Result<Option<i64>> {
             )),
         },
         _ => Err(Error::config(
-            format!("Invalid {} {}", name, value_text(value.unwrap_or(&Value::Null))),
+            format!(
+                "Invalid {} {}",
+                name,
+                value_text(value.unwrap_or(&Value::Null))
+            ),
             Some("Use a positive whole number.".to_string()),
         )),
     }
@@ -370,7 +384,11 @@ pub fn estimate_cost(price: &Price, input_tokens: i64, output_tokens: i64) -> De
     let cost = price
         .input_per_million
         .mul_int(input_tokens.max(0) as u128)
-        .add(price.output_per_million.mul_int(output_tokens.max(0) as u128))
+        .add(
+            price
+                .output_per_million
+                .mul_int(output_tokens.max(0) as u128),
+        )
         .div_million();
     cost.quantize6()
 }
@@ -390,7 +408,11 @@ pub fn preflight(
     let mut currencies: Vec<String> = Vec::new();
     let mut total: Option<Decimal> = Some(Decimal::ZERO);
     let mut gate = dollar_gate;
-    let saved_gate = if budget.enabled { budget.estimated_usd } else { None };
+    let saved_gate = if budget.enabled {
+        budget.estimated_usd
+    } else {
+        None
+    };
     if let (Some(dollar), Some(saved)) = (gate, saved_gate) {
         gate = Some(if dollar.cmp_decimal(&saved) == std::cmp::Ordering::Less {
             dollar
@@ -401,8 +423,16 @@ pub fn preflight(
         gate = saved_gate;
     }
 
-    let max_requests = if budget.enabled { budget.max_requests } else { None };
-    let max_output = if budget.enabled { budget.max_output_tokens } else { None };
+    let max_requests = if budget.enabled {
+        budget.max_requests
+    } else {
+        None
+    };
+    let max_output = if budget.enabled {
+        budget.max_output_tokens
+    } else {
+        None
+    };
     if let Some(max) = max_requests {
         if request_count > max as usize {
             reasons.push(format!(
@@ -444,13 +474,8 @@ pub fn preflight(
             }
             Some(cap) => {
                 if let Some(running) = total {
-                    total = Some(
-                        running.add(estimate_cost(
-                            price,
-                            call.input_tokens_estimate,
-                            cap,
-                        )),
-                    );
+                    total =
+                        Some(running.add(estimate_cost(price, call.input_tokens_estimate, cap)));
                 }
             }
         }
@@ -474,7 +499,11 @@ pub fn preflight(
         // Python is a three-way elif chain: a non-USD currency only raises
         // the currency reason; an unknown or missing estimate only raises
         // the coverage reason; otherwise the total is compared with the gate.
-        if currency.as_deref().map(|value| value != "USD").unwrap_or(false) {
+        if currency
+            .as_deref()
+            .map(|value| value != "USD")
+            .unwrap_or(false)
+        {
             reasons.push(format!(
                 "The budget gate is USD ({}), but the saved rates are {}. \
 Refusing rather than treating those rates as US dollars.",
@@ -506,7 +535,10 @@ Refusing rather than treating an unknown price as zero.",
     }
 
     let estimate_line = if total.is_some() && currency.is_some() {
-        let money = format_money(&total.unwrap().quantize6(), currency.as_deref().unwrap_or(""));
+        let money = format_money(
+            &total.unwrap().quantize6(),
+            currency.as_deref().unwrap_or(""),
+        );
         format!("Heuristic estimate {}. {}", money, DOLLAR_NOTE)
     } else if !unknown.is_empty() {
         format!(
@@ -525,7 +557,11 @@ Refusing rather than treating an unknown price as zero.",
     let allowed = reasons.is_empty();
     Preflight {
         allowed,
-        reason: if reasons.is_empty() { None } else { Some(reasons.join("; ")) },
+        reason: if reasons.is_empty() {
+            None
+        } else {
+            Some(reasons.join("; "))
+        },
         currency,
         estimate: total.map(|value| value.quantize6()),
         unknown,
@@ -594,7 +630,8 @@ pub fn tighter_dollar_gate(text: Option<&str>, _budget: &Budget) -> Result<Optio
 
 /// Mirrors `anyllm.budgets.repl_budget`.
 pub fn repl_budget(repl: &mut dyn crate::seam::Repl, rest: &str) -> Result<()> {
-    let tokens = split_words(rest).map_err(|exc| Error::usage(format!("Could not parse /budget: {}", exc), None))?;
+    let tokens = split_words(rest)
+        .map_err(|exc| Error::usage(format!("Could not parse /budget: {}", exc), None))?;
     if tokens.is_empty() || tokens[0] == "show" || tokens[0] == "status" {
         let budget = load_budget()?;
         let style = *repl.style();
@@ -605,9 +642,11 @@ pub fn repl_budget(repl: &mut dyn crate::seam::Repl, rest: &str) -> Result<()> {
     }
     if tokens[0] == "off" {
         budget_off()?;
-        repl.say(&repl
-            .style()
-            .dim("budget gates off (partial-merge confirmation still applies)"));
+        repl.say(
+            &repl
+                .style()
+                .dim("budget gates off (partial-merge confirmation still applies)"),
+        );
         return Ok(());
     }
     if tokens[0] != "set" {
@@ -634,7 +673,10 @@ or /budget off.",
         let key = match flags.iter().find(|(name, _)| name == flag) {
             Some((_, key)) => *key,
             None => {
-                return Err(Error::usage(format!("Unknown /budget flag {:?}.", flag), None));
+                return Err(Error::usage(
+                    format!("Unknown /budget flag {:?}.", flag),
+                    None,
+                ));
             }
         };
         if index + 1 >= tokens.len() {
@@ -658,7 +700,11 @@ or /budget off.",
         max_requests,
         max_output_tokens,
         estimated_usd,
-        confirm_above_requests: if confirm_above_requests == 0 { 4 } else { confirm_above_requests },
+        confirm_above_requests: if confirm_above_requests == 0 {
+            4
+        } else {
+            confirm_above_requests
+        },
         enabled: true,
     };
     save_budget(&updated)?;
@@ -697,7 +743,10 @@ pub fn budget_lines(style: &Style, budget: &Budget) -> Vec<String> {
         .map(|value| value.format_f())
         .unwrap_or_else(|| "unset".to_string());
     lines.push(format!("  estimated usd gate: {}", money));
-    lines.push(format!("  confirm above requests: {}", budget.confirm_above_requests));
+    lines.push(format!(
+        "  confirm above requests: {}",
+        budget.confirm_above_requests
+    ));
     lines.push(style.dim(&format!("  {}", DOLLAR_NOTE)));
     lines
 }
@@ -723,18 +772,25 @@ pub fn usage_cost_lines(
     lines.push(style.bold("Usage cost"));
     lines.push(format!("  input:     {}", text("input_tokens")));
     lines.push(format!("  output:    {}", text("output_tokens")));
-    lines.push(format!("  reasoning: {} (not added on top of output)", text("reasoning_tokens")));
-    lines.push(format!("  cached:    {} (not added on top of input)", text("cached_tokens")));
+    lines.push(format!(
+        "  reasoning: {} (not added on top of output)",
+        text("reasoning_tokens")
+    ));
+    lines.push(format!(
+        "  cached:    {} (not added on top of input)",
+        text("cached_tokens")
+    ));
     let currency_value = get("currency");
     let currency = currency_value.as_str().unwrap_or_default();
-    lines.push(format!(
-        "  estimate:  {} {}",
-        text("estimated_cost"),
-        currency
-    )
-    .trim_end()
-    .to_string());
-    lines.push(style.dim(&format!("  {}", info.get("note").and_then(Value::as_str).unwrap_or(""))));
+    lines.push(
+        format!("  estimate:  {} {}", text("estimated_cost"), currency)
+            .trim_end()
+            .to_string(),
+    );
+    lines.push(style.dim(&format!(
+        "  {}",
+        info.get("note").and_then(Value::as_str).unwrap_or("")
+    )));
     lines
 }
 
