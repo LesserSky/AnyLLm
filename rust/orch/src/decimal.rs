@@ -22,8 +22,14 @@ pub struct Decimal {
 pub struct DecimalError;
 
 impl Decimal {
-    pub const ZERO: Decimal = Decimal { mantissa: 0, scale: 0 };
-    pub const ONE: Decimal = Decimal { mantissa: 1, scale: 0 };
+    pub const ZERO: Decimal = Decimal {
+        mantissa: 0,
+        scale: 0,
+    };
+    pub const ONE: Decimal = Decimal {
+        mantissa: 1,
+        scale: 0,
+    };
 
     /// Parse a plain or scientific decimal literal, as `Decimal(str)` does.
     pub fn parse(text: &str) -> Result<Decimal, DecimalError> {
@@ -63,9 +69,7 @@ impl Decimal {
                 }
                 b'e' | b'E' if seen_digit => {
                     let rest = &raw[index + 1..];
-                    exponent = rest
-                        .parse::<i64>()
-                        .map_err(|_| DecimalError)?;
+                    exponent = rest.parse::<i64>().map_err(|_| DecimalError)?;
                     index = bytes.len();
                 }
                 _ => return Err(DecimalError),
@@ -89,7 +93,10 @@ impl Decimal {
         // The parsed scale is kept, like Python's Decimal, so `format_f`
         // round-trips "0.20" as "0.20".
         let mantissa = parse_digits(&all).ok_or(DecimalError)?;
-        Ok(Decimal { mantissa, scale: scale as u32 })
+        Ok(Decimal {
+            mantissa,
+            scale: scale as u32,
+        })
     }
 
     fn rescaled(&self, scale: u32) -> u128 {
@@ -111,12 +118,18 @@ impl Decimal {
 
     /// Multiply by a whole number.
     pub fn mul_int(&self, factor: u128) -> Decimal {
-        Decimal { mantissa: self.mantissa.saturating_mul(factor), scale: self.scale }
+        Decimal {
+            mantissa: self.mantissa.saturating_mul(factor),
+            scale: self.scale,
+        }
     }
 
     /// Divide by 10^6, exactly.
     pub fn div_million(&self) -> Decimal {
-        Decimal { mantissa: self.mantissa, scale: self.scale + 6 }
+        Decimal {
+            mantissa: self.mantissa,
+            scale: self.scale + 6,
+        }
     }
 
     /// Quantize to six decimal places with `ROUND_HALF_UP`.
@@ -124,7 +137,10 @@ impl Decimal {
         let target: u32 = 6;
         if self.scale <= target {
             let factor = pow10(target - self.scale);
-            Decimal { mantissa: self.mantissa * factor, scale: target }
+            Decimal {
+                mantissa: self.mantissa * factor,
+                scale: target,
+            }
         } else {
             let factor = pow10(self.scale - target);
             let quotient = self.mantissa / factor;
@@ -133,7 +149,10 @@ impl Decimal {
             if remainder * 2 >= factor {
                 rounded += 1;
             }
-            Decimal { mantissa: rounded, scale: target }
+            Decimal {
+                mantissa: rounded,
+                scale: target,
+            }
         }
     }
 
@@ -147,7 +166,10 @@ impl Decimal {
     }
 
     pub fn from_int(value: u128) -> Decimal {
-        Decimal { mantissa: value, scale: 0 }
+        Decimal {
+            mantissa: value,
+            scale: 0,
+        }
     }
 
     /// `format(x, "f")`: fixed notation, no exponent.
