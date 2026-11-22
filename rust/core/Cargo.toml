@@ -1,0 +1,20 @@
+[package]
+name = "anyllm-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde_json = "1"
+ureq = "2"
+base64 = "0.22"
+
+[dev-dependencies]
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_System_Console",
+    "Win32_System_Memory",
+] }

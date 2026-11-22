@@ -1,0 +1,15 @@
+[workspace]
+# NOTE (worker B): temporarily trimmed members to ["core"] because the
+# earlier "net" entry pointed at a crate that no worker owns and "cli" had
+# not been created yet, which broke every cargo command in this workspace.
+# Coordinator: re-add "orch", "cli", "tests" as those crates land.
+members = ["core"]
+resolver = "2"
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+
+[profile.release]
+lto = true
+strip = true
